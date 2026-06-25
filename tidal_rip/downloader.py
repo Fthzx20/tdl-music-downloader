@@ -21,10 +21,11 @@ class DownloadManager:
         self.is_paused = False
         self.is_cancelled = False
 
-    async def download_track(self, track_id, progress_callback=None):
+    async def download_track(self, track_id, progress_callback=None, parent_folder=None):
         """Downloads a track, parses manifest, concatenates segments, and writes tags.
         
         progress_callback: func(bytes_downloaded, total_bytes, status_text)
+        parent_folder: str (optional) A custom folder name to save the track in (e.g., Playlist Name)
         """
         if progress_callback:
             await progress_callback(0, 1, "Fetching metadata...")
@@ -49,7 +50,12 @@ class DownloadManager:
         safe_album = sanitize_filename(album_title)
         safe_title = sanitize_filename(title)
         
-        album_dir = os.path.join(self.config.download_directory, safe_artist, safe_album)
+        if parent_folder:
+            safe_parent = sanitize_filename(parent_folder)
+            album_dir = os.path.join(self.config.download_directory, safe_parent)
+        else:
+            album_dir = os.path.join(self.config.download_directory, safe_artist, safe_album)
+            
         os.makedirs(album_dir, exist_ok=True)
         
         # 2. Fetch Stream Info

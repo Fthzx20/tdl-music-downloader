@@ -132,7 +132,15 @@ def open_browser(url, browser_name):
         webbrowser.open(url)
 
 def parse_tidal_url(query):
-    """Parses track, album, playlist, or artist/singer links from Tidal."""
+    """Parses track, album, playlist, or artist/singer links from Tidal, including raw playlist UUIDs."""
+    query = query.strip()
+    
+    # Check for raw UUID (custom user playlist ID)
+    uuid_pattern = r"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+    uuid_match = re.search(uuid_pattern, query)
+    if uuid_match:
+        return "playlist", uuid_match.group(1)
+        
     patterns = {
         "track": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?track/(\d+)",
         "album": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?album/(\d+)",
@@ -492,7 +500,7 @@ class AppUI(CTk.CTk):
         search_ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 15))
         search_ctrl.grid_columnconfigure(0, weight=1)
         
-        self.search_entry = CTk.CTkEntry(search_ctrl, placeholder_text="Search tracks, albums, or playlists...", height=40, font=CTk.CTkFont(size=14))
+        self.search_entry = CTk.CTkEntry(search_ctrl, placeholder_text="Search terms, Tidal URL, or Playlist UUID...", height=40, font=CTk.CTkFont(size=14))
         self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.search_entry.bind("<Return>", lambda e: self.trigger_search())
         
@@ -716,7 +724,7 @@ class AppUI(CTk.CTk):
                 if tid in self.queue_order:
                     self.queue_order.remove(tid)
 
-    def queue_track_download(self, track_id, title):
+    def queue_track_download(self, track_id, title, parent_folder=None):
         if track_id in self.queue_items:
             messagebox.showinfo("Already Queued", f"'{title}' is already in the download queue.")
             return
@@ -744,7 +752,8 @@ class AppUI(CTk.CTk):
             "progress_bar": progress_bar,
             "status_lbl": status_lbl,
             "title": title,
-            "status": "queued"
+            "status": "queued",
+            "parent_folder": parent_folder
         }
         self.queue_order.append(track_id)
         
@@ -788,12 +797,15 @@ class AppUI(CTk.CTk):
             self.after(0, lambda: messagebox.showinfo("Playlist Queued", f"Adding {len(items)} tracks from playlist '{playlist_title}' to the download queue."))
             
             for item in items:
-                # Playlist response wraps tracks in a sub-field 'item'
-                track_info = item.get("item")
-                if track_info and track_info.get("type") == "track":
+                # Playlist response might wrap tracks in a sub-field 'item' or return them flat
+                track_info = item.get("item") if "item" in item else item
+                
+                if track_info and ("id" in track_info):
                     track_id = track_info["id"]
-                    title = f"{track_info['title']} - {track_info['artist']['name']}"
-                    self.after(0, self.queue_track_download, track_id, title)
+                    artists = track_info.get("artists", [])
+                    artist_name = artists[0]["name"] if artists else track_info.get("artist", {}).get("name", "Unknown Artist")
+                    title = f"{track_info.get('title', 'Unknown Title')} - {artist_name}"
+                    self.after(0, self.queue_track_download, track_id, title, playlist_title)
         except Exception as e:
             err_msg = str(e)
             self.after(0, lambda: messagebox.showerror("Playlist Error", f"Failed to download playlist tracks: {err_msg}"))
@@ -826,7 +838,8 @@ class AppUI(CTk.CTk):
                 
             try:
                 # Start downloading
-                await self.downloader.download_track(next_id, make_callback(next_id))
+                parent_folder = self.queue_items[next_id].get("parent_folder")
+                await self.downloader.download_track(next_id, make_callback(next_id), parent_folder)
                 self.queue_items[next_id]["status"] = "completed"
                 self.after(0, lambda nid=next_id: self.queue_items[nid]["progress_bar"].configure(progress_color="#4caf50")) # Green on success
             except Exception as e:
