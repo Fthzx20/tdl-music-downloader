@@ -60,6 +60,31 @@ class DownloadManager:
             
         os.makedirs(album_dir, exist_ok=True)
         
+        # Smart Skip
+        flac_path = os.path.join(album_dir, f"{track_num:02d} - {safe_title}.flac")
+        m4a_path = os.path.join(album_dir, f"{track_num:02d} - {safe_title}.m4a")
+        if (os.path.exists(flac_path) and os.path.getsize(flac_path) > 0) or \
+           (os.path.exists(m4a_path) and os.path.getsize(m4a_path) > 0):
+            if progress_callback:
+                await progress_callback(1, 1, "Skipped (Already Downloaded)")
+            return
+            
+        # 1.5 Fetch Lyrics
+        if progress_callback:
+            await progress_callback(0, 1, "Fetching lyrics...")
+        try:
+            lyrics_data = await self.api.get_track_lyrics(track_id)
+            if lyrics_data:
+                lrc_path = os.path.join(album_dir, f"{track_num:02d} - {safe_title}.lrc")
+                if lyrics_data.get("subtitles"):
+                    with open(lrc_path, "w", encoding="utf-8") as f:
+                        f.write(lyrics_data["subtitles"])
+                elif lyrics_data.get("lyrics"):
+                    with open(lrc_path, "w", encoding="utf-8") as f:
+                        f.write(lyrics_data["lyrics"])
+        except Exception as e:
+            print(f"Failed to fetch lyrics for {track_id}: {e}")
+            
         # 2. Fetch Stream Info
         quality = self.config.quality_tier
         if progress_callback:
@@ -78,42 +103,60 @@ class DownloadManager:
             if stream_info["type"] == "direct":
                 # Direct file download
                 url = stream_info["url"]
-                async with session.get(url) as resp:
-                    resp.raise_for_status()
-                    total_size = int(resp.headers.get("Content-Length", 0))
-                    downloaded = 0
-                    last_time = time.time()
-                    last_downloaded = 0
-                    smoothed_speed = None
-                    
-                    async with aiofiles.open(temp_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(1024 * 64):
-                            is_paused = self.is_paused or (task_state and task_state.get("is_paused", False))
-                            is_cancelled = self.is_cancelled or (task_state and task_state.get("is_cancelled", False))
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        downloaded = 0
+                        if os.path.exists(temp_path):
+                            downloaded = os.path.getsize(temp_path)
                             
-                            while is_paused and not is_cancelled:
-                                await asyncio.sleep(0.5)
-                                is_paused = self.is_paused or (task_state and task_state.get("is_paused", False))
-                                is_cancelled = self.is_cancelled or (task_state and task_state.get("is_cancelled", False))
-                                
-                            if is_cancelled:
-                                raise Exception("Cancelled by user")
-                                
-                            await f.write(chunk)
-                            downloaded += len(chunk)
+                        headers = {}
+                        if downloaded > 0:
+                            headers["Range"] = f"bytes={downloaded}-"
                             
-                            now = time.time()
-                            if now - last_time >= 0.5:
-                                current_speed = (downloaded - last_downloaded) / (now - last_time) # bytes/sec
-                                if smoothed_speed is None:
-                                    smoothed_speed = current_speed
-                                else:
-                                    smoothed_speed = 0.5 * smoothed_speed + 0.5 * current_speed
+                        async with session.get(url, headers=headers) as resp:
+                            resp.raise_for_status()
+                            total_size = int(resp.headers.get("Content-Length", 0)) + downloaded
+                            last_time = time.time()
+                            last_downloaded = downloaded
+                            smoothed_speed = None
+                            
+                            mode = "ab" if downloaded > 0 else "wb"
+                            async with aiofiles.open(temp_path, mode) as f:
+                                async for chunk in resp.content.iter_chunked(1024 * 64):
+                                    is_paused = self.is_paused or (task_state and task_state.get("is_paused", False))
+                                    is_cancelled = self.is_cancelled or (task_state and task_state.get("is_cancelled", False))
                                     
-                                last_time = now
-                                last_downloaded = downloaded
-                                if progress_callback:
-                                    await progress_callback(downloaded, total_size, f"Downloading: {downloaded / 1024 / 1024:>5.1f}MB / {total_size / 1024 / 1024:>5.1f}MB       ({smoothed_speed / 1024 / 1024:>4.1f} MB/s)")
+                                    while is_paused and not is_cancelled:
+                                        await asyncio.sleep(0.5)
+                                        is_paused = self.is_paused or (task_state and task_state.get("is_paused", False))
+                                        is_cancelled = self.is_cancelled or (task_state and task_state.get("is_cancelled", False))
+                                        
+                                    if is_cancelled:
+                                        raise Exception("Cancelled by user")
+                                        
+                                    await f.write(chunk)
+                                    downloaded += len(chunk)
+                                    
+                                    now = time.time()
+                                    if now - last_time >= 0.5:
+                                        current_speed = (downloaded - last_downloaded) / (now - last_time) # bytes/sec
+                                        if smoothed_speed is None:
+                                            smoothed_speed = current_speed
+                                        else:
+                                            smoothed_speed = 0.5 * smoothed_speed + 0.5 * current_speed
+                                            
+                                        last_time = now
+                                        last_downloaded = downloaded
+                                        if progress_callback:
+                                            await progress_callback(downloaded, total_size, f"Downloading: {downloaded / 1024 / 1024:>5.1f}MB / {total_size / 1024 / 1024:>5.1f}MB       ({smoothed_speed / 1024 / 1024:>4.1f} MB/s)")
+                        break # Exit retry loop on success
+                    except Exception as e:
+                        if (task_state and task_state.get("is_cancelled", False)) or self.is_cancelled or attempt == max_retries - 1:
+                            raise e
+                        if progress_callback:
+                            await progress_callback(downloaded, 1, f"Network Error. Retrying ({attempt+1}/{max_retries})...")
+                        await asyncio.sleep(2)
                                 
             elif stream_info["type"] == "dash":
                 # Fragmented DASH download with binary concatenation
@@ -149,27 +192,38 @@ class DownloadManager:
                         if is_cancelled:
                             raise Exception("Cancelled by user")
                             
-                        if progress_callback:
-                            await progress_callback(idx, total_segments, f"Downloading segment {idx + 1}/{total_segments}...")
-                        async with session.get(seg_url) as resp:
-                            resp.raise_for_status()
-                            async for chunk in resp.content.iter_chunked(1024 * 64):
-                                await f.write(chunk)
-                                downloaded += len(chunk)
-                                
-                                now = time.time()
-                                if now - last_time >= 0.5:
-                                    current_speed = (downloaded - last_downloaded) / (now - last_time) # bytes/sec
-                                    if smoothed_speed is None:
-                                        smoothed_speed = current_speed
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                if progress_callback:
+                                    if attempt > 0:
+                                        await progress_callback(idx, total_segments, f"Retrying segment {idx + 1:02d}/{total_segments:02d}... ({attempt}/{max_retries})")
                                     else:
-                                        smoothed_speed = 0.5 * smoothed_speed + 0.5 * current_speed
+                                        await progress_callback(idx, total_segments, f"Downloading segment {idx + 1:02d}/{total_segments:02d}...")
                                         
-                                    last_time = now
-                                    last_downloaded = downloaded
-                                    if progress_callback:
-                                        # Use idx as proxy for progress, but append speed
-                                        await progress_callback(idx, total_segments, f"Downloading segment {idx + 1:02d}/{total_segments:02d}       ({smoothed_speed / 1024 / 1024:>4.1f} MB/s)")
+                                async with session.get(seg_url) as resp:
+                                    resp.raise_for_status()
+                                    async for chunk in resp.content.iter_chunked(1024 * 64):
+                                        await f.write(chunk)
+                                        downloaded += len(chunk)
+                                        
+                                        now = time.time()
+                                        if now - last_time >= 0.5:
+                                            current_speed = (downloaded - last_downloaded) / (now - last_time) # bytes/sec
+                                            if smoothed_speed is None:
+                                                smoothed_speed = current_speed
+                                            else:
+                                                smoothed_speed = 0.5 * smoothed_speed + 0.5 * current_speed
+                                                
+                                            last_time = now
+                                            last_downloaded = downloaded
+                                            if progress_callback:
+                                                await progress_callback(idx, total_segments, f"Downloading segment {idx + 1:02d}/{total_segments:02d}       ({smoothed_speed / 1024 / 1024:>4.1f} MB/s)")
+                                break # Success
+                            except Exception as e:
+                                if (task_state and task_state.get("is_cancelled", False)) or self.is_cancelled or attempt == max_retries - 1:
+                                    raise e
+                                await asyncio.sleep(2)
                                 
             # Convert/Extract if needed
             if stream_info["type"] == "dash" and ext == "flac":

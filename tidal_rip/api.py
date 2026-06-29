@@ -217,6 +217,13 @@ class TidalAPI:
         """Gets metadata for a specific track."""
         return await self._api_request("GET", f"tracks/{track_id}")
 
+    async def get_track_lyrics(self, track_id):
+        """Gets lyrics for a specific track. Returns None if not found."""
+        try:
+            return await self._api_request("GET", f"tracks/{track_id}/lyrics")
+        except Exception:
+            return None
+
     async def get_album(self, album_id):
         """Gets metadata for a specific album."""
         return await self._api_request("GET", f"albums/{album_id}")
