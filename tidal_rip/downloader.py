@@ -234,16 +234,36 @@ class DownloadManager:
                 ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
                 raw_flac_path = final_path + ".raw.tmp"
                 try:
-                    result = subprocess.run(
-                        [ffmpeg_exe, "-y", "-i", temp_path, "-c:a", "copy", "-f", "flac", raw_flac_path],
-                        check=True, capture_output=True, text=True
+                    proc = await asyncio.create_subprocess_exec(
+                        ffmpeg_exe, "-y", "-i", temp_path, "-c:a", "copy", "-f", "flac", raw_flac_path,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
                     )
+                    
+                    async def wait_ffmpeg():
+                        return await proc.communicate()
+                        
+                    ff_task = asyncio.create_task(wait_ffmpeg())
+                    while not ff_task.done():
+                        if (task_state and task_state.get("is_cancelled", False)) or self.is_cancelled:
+                            proc.kill()
+                            raise Exception("Cancelled by user during extraction")
+                        await asyncio.sleep(0.5)
+                        
+                    stdout, stderr = ff_task.result()
+                    if proc.returncode != 0:
+                        err_msg = stderr.decode().strip().split('\n')[-1] if stderr else "Unknown error"
+                        raise Exception(f"Failed to extract FLAC stream. FFmpeg error: {err_msg}")
+                        
                     os.remove(temp_path)
                     temp_path = raw_flac_path
-                except subprocess.CalledProcessError as e:
-                    print(f"FFmpeg extraction failed with {e.returncode}: {e.stderr}")
-                    raise Exception(f"Failed to extract FLAC stream. FFmpeg error: {e.stderr.strip().split(chr(10))[-1]}")
+                except Exception as e:
+                    print(f"FFmpeg extraction failed: {e}")
+                    raise e
 
+            if (task_state and task_state.get("is_cancelled", False)) or self.is_cancelled:
+                raise Exception("Cancelled by user before tagging")
+                
             # Rename temp file to final destination
             if os.path.exists(final_path):
                 os.remove(final_path)
@@ -265,8 +285,8 @@ class DownloadManager:
                 except Exception as e:
                     print(f"Failed to fetch album cover: {e}")
                     
-            # Apply tags using Mutagen
-            self.apply_metadata(final_path, ext, {
+            # Apply tags using Mutagen in a background thread to prevent blocking the async loop
+            tags_dict = {
                 "title": title,
                 "artist": artist_name,
                 "album": album_title,
@@ -276,7 +296,8 @@ class DownloadManager:
                 "date": release_date,
                 "genre": genre,
                 "cover_bytes": cover_bytes
-            })
+            }
+            await asyncio.to_thread(self.apply_metadata, final_path, ext, tags_dict)
             
             if progress_callback:
                 await progress_callback(1, 1, "Completed")

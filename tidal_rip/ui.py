@@ -263,11 +263,53 @@ class AppUI(CTk.CTk):
         
         # Check login status
         self.check_login_status()
+        
+        # Load saved session
+        self.after(500, self.load_session)
 
     def on_closing(self):
-        """Handle application close event to cancel downloads."""
+        """Handle application close event to cancel downloads and save session."""
+        try:
+            session_data = []
+            for tid in self.pending_downloads:
+                if tid in self.queue_items:
+                    item = self.queue_items[tid]
+                    session_data.append({
+                        "track_id": tid,
+                        "title": item["title"],
+                        "parent_folder": item.get("parent_folder")
+                    })
+            
+            session_file = os.path.join(self.config.config_dir, "session.json")
+            import json
+            with open(session_file, "w", encoding="utf-8") as f:
+                json.dump(session_data, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"Failed to save session: {e}")
+            
         self.downloader.is_cancelled = True
         self.destroy()
+
+    def load_session(self):
+        """Loads pending downloads from the previous session."""
+        try:
+            session_file = os.path.join(self.config.config_dir, "session.json")
+            if os.path.exists(session_file):
+                import json
+                with open(session_file, "r", encoding="utf-8") as f:
+                    session_data = json.load(f)
+                
+                if session_data:
+                    for data in session_data:
+                        self.queue_track_download(data["track_id"], data["title"], data.get("parent_folder"))
+                    
+                    import tkinter.messagebox as messagebox
+                    messagebox.showinfo("Session Restored", f"Restored {len(session_data)} pending downloads from your previous session.")
+                    
+                # Clear the file after loading
+                os.remove(session_file)
+        except Exception as e:
+            print(f"Failed to load session: {e}")
 
     def run_async(self, coro):
         """Helper to run a coroutine safely in the background event loop."""
@@ -787,6 +829,21 @@ class AppUI(CTk.CTk):
                 self.pending_downloads.remove(track_id)
                 self.pending_downloads.insert(0, track_id)
                 
+                if track_id in self.queue_order:
+                    self.queue_order.remove(track_id)
+                    insert_idx = len(self.queue_order)
+                    for i, tid in enumerate(self.queue_order):
+                        if self.queue_items[tid]["status"] == "queued":
+                            insert_idx = i
+                            break
+                    self.queue_order.insert(insert_idx, track_id)
+                    
+                    for tid in self.queue_order:
+                        item_row = self.queue_items.get(tid, {}).get("row")
+                        if item_row:
+                            item_row.pack_forget()
+                            item_row.pack(fill="x", pady=5, padx=5)
+                
         pause_btn.configure(command=toggle_item_pause)
         cancel_btn.configure(command=cancel_item)
         top_btn.configure(command=move_item_to_top)
@@ -873,23 +930,27 @@ class AppUI(CTk.CTk):
         def make_callback(tid):
             async def progress_update(downloaded, total, status_text):
                 progress = float(downloaded) / max(1.0, float(total))
-                # Safely schedule label and progress updates on UI thread
-                self.after(0, lambda: self.queue_items[tid]["progress_bar"].set(progress))
-                self.after(0, lambda: self.queue_items[tid]["status_lbl"].configure(text=status_text))
+                def safe_update():
+                    if tid in self.queue_items:
+                        self.queue_items[tid]["progress_bar"].set(progress)
+                        self.queue_items[tid]["status_lbl"].configure(text=status_text)
+                self.after(0, safe_update)
             return progress_update
             
         try:
             parent_folder = self.queue_items[tid].get("parent_folder")
             task_state = self.queue_items[tid].get("task_state")
             await self.downloader.download_track(tid, make_callback(tid), parent_folder, task_state)
-            self.queue_items[tid]["status"] = "completed"
-            self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#4caf50")) # Green on success
-            self.after(0, lambda nid=tid: self.queue_items[nid]["status_lbl"].configure(text="Completed"))
+            if tid in self.queue_items:
+                self.queue_items[tid]["status"] = "completed"
+                self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#4caf50") if nid in self.queue_items else None)
+                self.after(0, lambda nid=tid: self.queue_items[nid]["status_lbl"].configure(text="Completed") if nid in self.queue_items else None)
         except Exception as e:
             print(f"Download failed for track {tid}: {e}")
-            self.queue_items[tid]["status"] = "failed"
-            self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#f44336")) # Red on error
-            self.after(0, lambda nid=tid: self.queue_items[nid]["status_lbl"].configure(text="Failed", text_color="#f44336"))
+            if tid in self.queue_items:
+                self.queue_items[tid]["status"] = "failed"
+                self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#f44336") if nid in self.queue_items else None)
+                self.after(0, lambda nid=tid: self.queue_items[nid]["status_lbl"].configure(text="Failed", text_color="#f44336") if nid in self.queue_items else None)
 
     # --- Settings View ---
 
