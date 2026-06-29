@@ -4,6 +4,7 @@ import aiohttp
 import aiofiles
 import asyncio
 import subprocess
+import time
 import imageio_ffmpeg
 from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
@@ -21,11 +22,12 @@ class DownloadManager:
         self.is_paused = False
         self.is_cancelled = False
 
-    async def download_track(self, track_id, progress_callback=None, parent_folder=None):
+    async def download_track(self, track_id, progress_callback=None, parent_folder=None, task_state=None):
         """Downloads a track, parses manifest, concatenates segments, and writes tags.
         
         progress_callback: func(bytes_downloaded, total_bytes, status_text)
         parent_folder: str (optional) A custom folder name to save the track in (e.g., Playlist Name)
+        task_state: dict (optional) Dictionary containing {"is_paused": bool, "is_cancelled": bool}
         """
         if progress_callback:
             await progress_callback(0, 1, "Fetching metadata...")
@@ -80,18 +82,38 @@ class DownloadManager:
                     resp.raise_for_status()
                     total_size = int(resp.headers.get("Content-Length", 0))
                     downloaded = 0
+                    last_time = time.time()
+                    last_downloaded = 0
+                    smoothed_speed = None
                     
                     async with aiofiles.open(temp_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(1024 * 64):
-                            while self.is_paused and not self.is_cancelled:
+                            is_paused = self.is_paused or (task_state and task_state.get("is_paused", False))
+                            is_cancelled = self.is_cancelled or (task_state and task_state.get("is_cancelled", False))
+                            
+                            while is_paused and not is_cancelled:
                                 await asyncio.sleep(0.5)
-                            if self.is_cancelled:
+                                is_paused = self.is_paused or (task_state and task_state.get("is_paused", False))
+                                is_cancelled = self.is_cancelled or (task_state and task_state.get("is_cancelled", False))
+                                
+                            if is_cancelled:
                                 raise Exception("Cancelled by user")
                                 
                             await f.write(chunk)
                             downloaded += len(chunk)
-                            if progress_callback:
-                                await progress_callback(downloaded, total_size, f"Downloading: {downloaded / 1024 / 1024:.1f}MB / {total_size / 1024 / 1024:.1f}MB")
+                            
+                            now = time.time()
+                            if now - last_time >= 0.5:
+                                current_speed = (downloaded - last_downloaded) / (now - last_time) # bytes/sec
+                                if smoothed_speed is None:
+                                    smoothed_speed = current_speed
+                                else:
+                                    smoothed_speed = 0.5 * smoothed_speed + 0.5 * current_speed
+                                    
+                                last_time = now
+                                last_downloaded = downloaded
+                                if progress_callback:
+                                    await progress_callback(downloaded, total_size, f"Downloading: {downloaded / 1024 / 1024:>5.1f}MB / {total_size / 1024 / 1024:>5.1f}MB       ({smoothed_speed / 1024 / 1024:>4.1f} MB/s)")
                                 
             elif stream_info["type"] == "dash":
                 # Fragmented DASH download with binary concatenation
@@ -101,6 +123,9 @@ class DownloadManager:
                 # Estimate total size if possible
                 total_segments = len(segment_urls)
                 downloaded = 0
+                last_time = time.time()
+                last_downloaded = 0
+                smoothed_speed = None
                 
                 async with aiofiles.open(temp_path, "wb") as f:
                     # Download initialization segment
@@ -113,9 +138,15 @@ class DownloadManager:
                     
                     # Download each media segment in order
                     for idx, seg_url in enumerate(segment_urls):
-                        while self.is_paused and not self.is_cancelled:
+                        is_paused = self.is_paused or (task_state and task_state.get("is_paused", False))
+                        is_cancelled = self.is_cancelled or (task_state and task_state.get("is_cancelled", False))
+                        
+                        while is_paused and not is_cancelled:
                             await asyncio.sleep(0.5)
-                        if self.is_cancelled:
+                            is_paused = self.is_paused or (task_state and task_state.get("is_paused", False))
+                            is_cancelled = self.is_cancelled or (task_state and task_state.get("is_cancelled", False))
+                            
+                        if is_cancelled:
                             raise Exception("Cancelled by user")
                             
                         if progress_callback:
@@ -124,6 +155,21 @@ class DownloadManager:
                             resp.raise_for_status()
                             async for chunk in resp.content.iter_chunked(1024 * 64):
                                 await f.write(chunk)
+                                downloaded += len(chunk)
+                                
+                                now = time.time()
+                                if now - last_time >= 0.5:
+                                    current_speed = (downloaded - last_downloaded) / (now - last_time) # bytes/sec
+                                    if smoothed_speed is None:
+                                        smoothed_speed = current_speed
+                                    else:
+                                        smoothed_speed = 0.5 * smoothed_speed + 0.5 * current_speed
+                                        
+                                    last_time = now
+                                    last_downloaded = downloaded
+                                    if progress_callback:
+                                        # Use idx as proxy for progress, but append speed
+                                        await progress_callback(idx, total_segments, f"Downloading segment {idx + 1:02d}/{total_segments:02d}       ({smoothed_speed / 1024 / 1024:>4.1f} MB/s)")
                                 
             # Convert/Extract if needed
             if stream_info["type"] == "dash" and ext == "flac":

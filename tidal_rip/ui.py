@@ -252,7 +252,7 @@ class AppUI(CTk.CTk):
         self.search_results = []
         self.queue_items = {} # track_id -> UI elements and stats
         self.queue_order = []
-        self.is_downloading = False
+        self.download_semaphore = asyncio.Semaphore(3)
         
         # Create Layout
         self.setup_layout()
@@ -710,7 +710,6 @@ class AppUI(CTk.CTk):
             
     def _reset_cancel_flag(self):
         self.downloader.is_cancelled = False
-        self.is_downloading = False
         
     def clear_finished_downloads(self):
         """Removes completed, failed, and cancelled items from the UI queue."""
@@ -744,23 +743,55 @@ class AppUI(CTk.CTk):
         progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 15))
         progress_bar.set(0.0)
         
-        status_lbl = CTk.CTkLabel(progress_frame, text="Queued", font=CTk.CTkFont(size=11), text_color=COLOR_TEXT_MUTED, width=150, anchor="e")
-        status_lbl.pack(side="right")
+        ctrl_frame = CTk.CTkFrame(progress_frame, fg_color="transparent")
+        ctrl_frame.pack(side="right")
+        
+        lbl_frame = CTk.CTkFrame(ctrl_frame, width=280, height=20, fg_color="transparent")
+        lbl_frame.pack(side="left", padx=(0, 10))
+        lbl_frame.pack_propagate(False)
+        
+        status_lbl = CTk.CTkLabel(lbl_frame, text="Queued", font=CTk.CTkFont(family="Consolas", size=11), text_color=COLOR_TEXT_MUTED, anchor="w")
+        status_lbl.pack(side="left", fill="both", expand=True)
+        
+        pause_btn = CTk.CTkButton(ctrl_frame, text="⏸", width=25, height=20, fg_color="#ff9800", hover_color="#f57c00", text_color="black")
+        pause_btn.pack(side="left", padx=2)
+        
+        cancel_btn = CTk.CTkButton(ctrl_frame, text="✖", width=25, height=20, fg_color="#f44336", hover_color="#d32f2f", text_color="white")
+        cancel_btn.pack(side="left", padx=2)
+        
+        task_state = {"is_paused": False, "is_cancelled": False}
+        
+        def toggle_item_pause():
+            if task_state["is_paused"]:
+                task_state["is_paused"] = False
+                pause_btn.configure(text="⏸")
+            else:
+                task_state["is_paused"] = True
+                pause_btn.configure(text="▶")
+                
+        def cancel_item():
+            task_state["is_cancelled"] = True
+            if self.queue_items[track_id]["status"] == "queued":
+                self.queue_items[track_id]["status"] = "cancelled"
+                status_lbl.configure(text="Cancelled", text_color="#f44336")
+                
+        pause_btn.configure(command=toggle_item_pause)
+        cancel_btn.configure(command=cancel_item)
         
         self.queue_items[track_id] = {
             "row": row,
             "progress_bar": progress_bar,
             "status_lbl": status_lbl,
+            "pause_btn": pause_btn,
             "title": title,
             "status": "queued",
-            "parent_folder": parent_folder
+            "parent_folder": parent_folder,
+            "task_state": task_state
         }
         self.queue_order.append(track_id)
         
-        # Trigger download loop if idle
-        if not self.is_downloading:
-            self.is_downloading = True
-            self.run_async(self.process_queue_downloads())
+        # Spawn download task bounded by semaphore
+        self.run_async(self.process_single_download(track_id))
             
         # Switch to Queue tab to see progress
         self.switch_view("queue")
@@ -810,24 +841,14 @@ class AppUI(CTk.CTk):
             err_msg = str(e)
             self.after(0, lambda: messagebox.showerror("Playlist Error", f"Failed to download playlist tracks: {err_msg}"))
 
-    async def process_queue_downloads(self):
-        """Sequential background processing of queued downloads."""
-        while True:
-            # Find next queued item
-            next_id = None
-            for track_id in self.queue_order:
-                if self.queue_items[track_id]["status"] == "queued":
-                    next_id = track_id
-                    break
-                    
-            if not next_id:
-                # Queue completed
-                self.is_downloading = False
-                break
+    async def process_single_download(self, tid):
+        """Processes a single download task, bounded by the concurrency semaphore."""
+        async with self.download_semaphore:
+            if self.queue_items[tid]["status"] == "cancelled" or self.queue_items[tid]["task_state"]["is_cancelled"]:
+                return
                 
-            self.queue_items[next_id]["status"] = "downloading"
+            self.queue_items[tid]["status"] = "downloading"
             
-            # Define progress updates callback
             def make_callback(tid):
                 async def progress_update(downloaded, total, status_text):
                     progress = float(downloaded) / max(1.0, float(total))
@@ -837,16 +858,17 @@ class AppUI(CTk.CTk):
                 return progress_update
                 
             try:
-                # Start downloading
-                parent_folder = self.queue_items[next_id].get("parent_folder")
-                await self.downloader.download_track(next_id, make_callback(next_id), parent_folder)
-                self.queue_items[next_id]["status"] = "completed"
-                self.after(0, lambda nid=next_id: self.queue_items[nid]["progress_bar"].configure(progress_color="#4caf50")) # Green on success
+                parent_folder = self.queue_items[tid].get("parent_folder")
+                task_state = self.queue_items[tid].get("task_state")
+                await self.downloader.download_track(tid, make_callback(tid), parent_folder, task_state)
+                self.queue_items[tid]["status"] = "completed"
+                self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#4caf50")) # Green on success
+                self.after(0, lambda nid=tid: self.queue_items[nid]["status_lbl"].configure(text="Completed"))
             except Exception as e:
-                print(f"Download failed for track {next_id}: {e}")
-                self.queue_items[next_id]["status"] = "failed"
-                self.after(0, lambda nid=next_id: self.queue_items[nid]["progress_bar"].configure(progress_color="#f44336")) # Red on error
-                self.after(0, lambda nid=next_id, err=e: self.queue_items[nid]["status_lbl"].configure(text=f"Failed: {err}", text_color="#f44336"))
+                print(f"Download failed for track {tid}: {e}")
+                self.queue_items[tid]["status"] = "failed"
+                self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#f44336")) # Red on error
+                self.after(0, lambda nid=tid, err=e: self.queue_items[nid]["status_lbl"].configure(text=f"Failed: {err}", text_color="#f44336"))
 
     # --- Settings View ---
 
