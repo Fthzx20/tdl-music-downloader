@@ -70,6 +70,7 @@ class DownloadManager:
             return
             
         # 1.5 Fetch Lyrics
+        lyrics_text = ""
         if progress_callback:
             await progress_callback(0, 1, "Fetching lyrics...")
         try:
@@ -77,11 +78,12 @@ class DownloadManager:
             if lyrics_data:
                 lrc_path = os.path.join(album_dir, f"{track_num:02d} - {safe_title}.lrc")
                 if lyrics_data.get("subtitles"):
-                    with open(lrc_path, "w", encoding="utf-8") as f:
-                        f.write(lyrics_data["subtitles"])
+                    lyrics_text = lyrics_data["subtitles"]
                 elif lyrics_data.get("lyrics"):
+                    lyrics_text = lyrics_data["lyrics"]
+                if lyrics_text:
                     with open(lrc_path, "w", encoding="utf-8") as f:
-                        f.write(lyrics_data["lyrics"])
+                        f.write(lyrics_text)
         except Exception as e:
             print(f"Failed to fetch lyrics for {track_id}: {e}")
             
@@ -295,7 +297,8 @@ class DownloadManager:
                 "disc_num": disc_num,
                 "date": release_date,
                 "genre": genre,
-                "cover_bytes": cover_bytes
+                "cover_bytes": cover_bytes,
+                "lyrics": lyrics_text
             }
             await asyncio.to_thread(self.apply_metadata, final_path, ext, tags_dict)
             
@@ -336,6 +339,9 @@ class DownloadManager:
                 audio.clear_pictures()
                 audio.add_picture(picture)
                 
+            if tags.get("lyrics"):
+                audio["UNSYNCEDLYRICS"] = tags["lyrics"]
+                
             audio.save()
             
         elif ext == "m4a":
@@ -350,5 +356,8 @@ class DownloadManager:
             
             if cover_bytes:
                 audio["covr"] = [MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+                
+            if tags.get("lyrics"):
+                audio["\xa9lyr"] = tags["lyrics"]
                 
             audio.save()

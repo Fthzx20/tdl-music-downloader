@@ -315,8 +315,13 @@ class TidalAPI:
             
             # Codec detection from manifest XML
             ext = "flac"
-            codec = dash_info.get("codec", "")
+            codec = dash_info.get("codec", "").lower()
             if "mp4a" in codec or "aac" in codec:
+                ext = "m4a"
+            elif "ec-3" in codec or "ac-4" in codec:
+                if not getattr(self.config, "allow_dolby_atmos", False):
+                    print("Dolby Atmos detected but disallowed by settings. Falling back to LOSSLESS stereo FLAC.")
+                    return await self.get_stream_info(track_id, "LOSSLESS")
                 ext = "m4a"
                 
             return {

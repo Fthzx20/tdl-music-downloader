@@ -719,6 +719,9 @@ class AppUI(CTk.CTk):
         title_lbl = CTk.CTkLabel(header, text="Download Progress Monitor", font=CTk.CTkFont(size=16, weight="bold"))
         title_lbl.pack(side="left")
         
+        self.queue_summary_lbl = CTk.CTkLabel(header, text="", font=CTk.CTkFont(size=12), text_color=COLOR_TEXT_MUTED)
+        self.queue_summary_lbl.pack(side="left", padx=15)
+        
         self.pause_btn = CTk.CTkButton(header, text="Pause", width=80, fg_color="#ff9800", hover_color="#f57c00", text_color="black", command=self.toggle_pause)
         self.pause_btn.pack(side="right", padx=5)
         
@@ -731,6 +734,16 @@ class AppUI(CTk.CTk):
         # Scroll area
         self.queue_scroll = CTk.CTkScrollableFrame(self.queue_view, fg_color=COLOR_FRAME_BG)
         self.queue_scroll.grid(row=1, column=0, sticky="nsew")
+
+    def update_queue_summary(self):
+        total = len(self.queue_items)
+        if total == 0:
+            self.queue_summary_lbl.configure(text="")
+            return
+        completed = sum(1 for item in self.queue_items.values() if item["status"] == "completed")
+        failed = sum(1 for item in self.queue_items.values() if item["status"] == "failed")
+        pending = sum(1 for item in self.queue_items.values() if item["status"] in ["queued", "downloading"])
+        self.queue_summary_lbl.configure(text=f"Total: {total} | Completed: {completed} | Failed: {failed} | Pending: {pending}")
 
     def toggle_pause(self):
         if self.downloader.is_paused:
@@ -768,6 +781,7 @@ class AppUI(CTk.CTk):
                 del self.queue_items[tid]
                 if tid in self.queue_order:
                     self.queue_order.remove(tid)
+        self.update_queue_summary()
 
     def queue_track_download(self, track_id, title, parent_folder=None):
         if track_id in self.queue_items:
@@ -848,11 +862,29 @@ class AppUI(CTk.CTk):
         cancel_btn.configure(command=cancel_item)
         top_btn.configure(command=move_item_to_top)
         
+        def retry_item():
+            if self.queue_items[track_id]["status"] == "failed":
+                self.queue_items[track_id]["status"] = "queued"
+                status_lbl.configure(text="Queued", text_color=COLOR_TEXT_MUTED)
+                progress_bar.set(0.0)
+                progress_bar.configure(progress_color=COLOR_ACCENT)
+                task_state["is_paused"] = False
+                task_state["is_cancelled"] = False
+                pause_btn.configure(text="⏸", state="normal")
+                cancel_btn.configure(state="normal")
+                retry_btn.pack_forget()
+                self.pending_downloads.append(track_id)
+                self.update_queue_summary()
+                
+        retry_btn = CTk.CTkButton(ctrl_frame, text="🔁", width=25, height=20, fg_color="#2196f3", hover_color="#1976d2", text_color="white", command=retry_item)
+        
         self.queue_items[track_id] = {
             "row": row,
             "progress_bar": progress_bar,
             "status_lbl": status_lbl,
             "pause_btn": pause_btn,
+            "cancel_btn": cancel_btn,
+            "retry_btn": retry_btn,
             "title": title,
             "status": "queued",
             "parent_folder": parent_folder,
@@ -860,6 +892,7 @@ class AppUI(CTk.CTk):
         }
         self.queue_order.append(track_id)
         self.pending_downloads.append(track_id)
+        self.update_queue_summary()
             
         # Switch to Queue tab to see progress
         self.switch_view("queue")
@@ -945,12 +978,15 @@ class AppUI(CTk.CTk):
                 self.queue_items[tid]["status"] = "completed"
                 self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#4caf50") if nid in self.queue_items else None)
                 self.after(0, lambda nid=tid: self.queue_items[nid]["status_lbl"].configure(text="Completed") if nid in self.queue_items else None)
+                self.after(0, self.update_queue_summary)
         except Exception as e:
             print(f"Download failed for track {tid}: {e}")
             if tid in self.queue_items:
                 self.queue_items[tid]["status"] = "failed"
                 self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#f44336") if nid in self.queue_items else None)
                 self.after(0, lambda nid=tid: self.queue_items[nid]["status_lbl"].configure(text="Failed", text_color="#f44336") if nid in self.queue_items else None)
+                self.after(0, lambda nid=tid: self.queue_items[nid]["retry_btn"].pack(side="left", padx=2) if nid in self.queue_items else None)
+                self.after(0, self.update_queue_summary)
 
     # --- Settings View ---
 
@@ -1005,6 +1041,17 @@ class AppUI(CTk.CTk):
         current_quality_str = self.quality_reverse_map.get(self.config.quality_tier, "HiFi (CD-Quality Lossless FLAC)")
         self.quality_menu.set(current_quality_str)
         
+        # Atmos Selection
+        atmos_lbl = CTk.CTkLabel(self.settings_view, text="Allow Dolby Atmos (Immersive Audio)", font=CTk.CTkFont(size=13, weight="bold"))
+        atmos_lbl.pack(anchor="w", pady=(5, 5))
+        
+        self.atmos_switch = CTk.CTkSwitch(self.settings_view, text="Enable Dolby Atmos streams if available", progress_color=COLOR_ACCENT)
+        self.atmos_switch.pack(anchor="w", pady=(0, 20))
+        if self.config.allow_dolby_atmos:
+            self.atmos_switch.select()
+        else:
+            self.atmos_switch.deselect()
+        
         # Browser Selection
         browser_lbl = CTk.CTkLabel(self.settings_view, text="Login Browser Selection", font=CTk.CTkFont(size=13, weight="bold"))
         browser_lbl.pack(anchor="w", pady=(5, 5))
@@ -1055,6 +1102,7 @@ class AppUI(CTk.CTk):
         new_dir = self.folder_entry.get().strip()
         new_quality = self.quality_map.get(self.quality_menu.get(), "LOSSLESS")
         new_browser = self.browser_menu.get()
+        new_atmos = bool(self.atmos_switch.get())
         new_id = self.client_id_entry.get().strip()
         new_secret = self.client_secret_entry.get().strip()
         
@@ -1069,6 +1117,7 @@ class AppUI(CTk.CTk):
         self.config.download_directory = new_dir
         self.config.quality_tier = new_quality
         self.config.login_browser = new_browser
+        self.config.allow_dolby_atmos = new_atmos
         
         # Check if keys changed
         keys_changed = (self.config.client_id != new_id or self.config.client_secret != new_secret)
