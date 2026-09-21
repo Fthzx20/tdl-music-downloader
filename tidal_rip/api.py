@@ -66,6 +66,15 @@ class TidalAPI:
                             raise Exception(f"API request failed with status {retry_resp.status}: {err_text}")
                         return await retry_resp.json()
                 
+                if resp.status == 429:
+                    print("Received 429 Too Many Requests from Tidal. Backing off 2s and retrying...")
+                    await asyncio.sleep(2.0)
+                    async with session.request(method, url, headers=headers, params=request_params, json=json_data) as retry_resp:
+                        if retry_resp.status >= 400:
+                            err_text = await retry_resp.text()
+                            raise Exception(f"Rate limited by Tidal (429): {err_text}")
+                        return await retry_resp.json()
+                
                 if resp.status >= 400:
                     err_text = await resp.text()
                     raise Exception(f"API request failed with status {resp.status}: {err_text}")
@@ -305,7 +314,11 @@ class TidalAPI:
                 "type": "direct",
                 "url": urls[0],
                 "extension": ext,
-                "bitrate": manifest_json.get("bitrate")
+                "bitrate": manifest_json.get("bitrate"),
+                "bit_depth": resp.get("bitDepth"),
+                "sample_rate": resp.get("sampleRate"),
+                "audio_quality": resp.get("audioQuality"),
+                "audio_mode": resp.get("audioMode", "STEREO")
             }
             
         elif mime_type == "application/dash+xml":
@@ -328,10 +341,38 @@ class TidalAPI:
                 "type": "dash",
                 "init_url": dash_info["init_url"],
                 "segment_urls": dash_info["urls"],
-                "extension": ext
+                "extension": ext,
+                "bit_depth": resp.get("bitDepth"),
+                "sample_rate": resp.get("sampleRate"),
+                "audio_quality": resp.get("audioQuality"),
+                "audio_mode": resp.get("audioMode", "STEREO")
             }
         else:
             raise Exception(f"Unsupported manifest MIME type: {mime_type}")
+
+    async def get_track_specs(self, track_id, quality=None):
+        """Fetches accurate stream resolution specs (bitDepth, sampleRate, audioQuality, audioMode)."""
+        if quality is None:
+            quality = getattr(self.config, "quality_tier", "HI_RES_LOSSLESS")
+        params = {
+            "playbackmode": "STREAM",
+            "assetpresentation": "FULL",
+            "audioquality": quality
+        }
+        try:
+            resp = await self._api_request("GET", f"tracks/{track_id}/playbackinfopostpaywall", params=params)
+            bit_depth = resp.get("bitDepth")
+            sample_rate = resp.get("sampleRate")
+            audio_quality = resp.get("audioQuality", "")
+            audio_mode = resp.get("audioMode", "STEREO")
+            return {
+                "bit_depth": bit_depth,
+                "sample_rate": sample_rate,
+                "audio_quality": audio_quality,
+                "audio_mode": audio_mode
+            }
+        except Exception:
+            return None
 
     def _parse_dash_manifest(self, xml_content):
         """Parses MPEG-DASH XML content to extract initialization and segment URLs."""

@@ -51,53 +51,54 @@ class DownloadManager:
         safe_artist = sanitize_filename(artist_name)
         safe_album = sanitize_filename(album_title)
         safe_title = sanitize_filename(title)
-        
+
+        template = getattr(self.config, 'file_template', '{artist}/{album}/{track_num} - {title}.{ext}')
+        base_dir = self.config.download_directory
         if parent_folder:
             safe_parent = sanitize_filename(parent_folder)
-            album_dir = os.path.join(self.config.download_directory, safe_parent)
-        else:
-            album_dir = os.path.join(self.config.download_directory, safe_artist, safe_album)
-            
+            base_dir = os.path.join(base_dir, safe_parent)
+
+        rel_path_flac = template.format(artist=safe_artist, album=safe_album, track_num=f'{track_num:02d}', title=safe_title, ext='flac')
+        rel_path_m4a = template.format(artist=safe_artist, album=safe_album, track_num=f'{track_num:02d}', title=safe_title, ext='m4a')
+        rel_path_flac = rel_path_flac.replace('/', os.sep).replace('\\', os.sep)
+        rel_path_m4a = rel_path_m4a.replace('/', os.sep).replace('\\', os.sep)
+
+        flac_path = os.path.join(base_dir, rel_path_flac)
+        m4a_path = os.path.join(base_dir, rel_path_m4a)
+
+        album_dir = os.path.dirname(flac_path)
         os.makedirs(album_dir, exist_ok=True)
-        
-        # Smart Skip
-        flac_path = os.path.join(album_dir, f"{track_num:02d} - {safe_title}.flac")
-        m4a_path = os.path.join(album_dir, f"{track_num:02d} - {safe_title}.m4a")
-        if (os.path.exists(flac_path) and os.path.getsize(flac_path) > 0) or \
-           (os.path.exists(m4a_path) and os.path.getsize(m4a_path) > 0):
-            if progress_callback:
-                await progress_callback(1, 1, "Skipped (Already Downloaded)")
-            return
-            
-        # 1.5 Fetch Lyrics
-        lyrics_text = ""
-        if progress_callback:
-            await progress_callback(0, 1, "Fetching lyrics...")
+
+        if os.path.exists(flac_path) and os.path.getsize(flac_path) > 0:
+            if progress_callback: await progress_callback(1, 1, 'Skipped (Already Downloaded)')
+            return flac_path
+        if os.path.exists(m4a_path) and os.path.getsize(m4a_path) > 0:
+            if progress_callback: await progress_callback(1, 1, 'Skipped (Already Downloaded)')
+            return m4a_path
+
+        lyrics_text = ''
+        if progress_callback: await progress_callback(0, 1, 'Fetching lyrics...')
         try:
             lyrics_data = await self.api.get_track_lyrics(track_id)
             if lyrics_data:
-                lrc_path = os.path.join(album_dir, f"{track_num:02d} - {safe_title}.lrc")
-                if lyrics_data.get("subtitles"):
-                    lyrics_text = lyrics_data["subtitles"]
-                elif lyrics_data.get("lyrics"):
-                    lyrics_text = lyrics_data["lyrics"]
+                lrc_path = os.path.join(album_dir, f'{track_num:02d} - {safe_title}.lrc')
+                if lyrics_data.get('subtitles'):
+                    lyrics_text = lyrics_data['subtitles']
+                elif lyrics_data.get('lyrics'):
+                    lyrics_text = lyrics_data['lyrics']
                 if lyrics_text:
-                    with open(lrc_path, "w", encoding="utf-8") as f:
-                        f.write(lyrics_text)
-        except Exception as e:
-            print(f"Failed to fetch lyrics for {track_id}: {e}")
-            
-        # 2. Fetch Stream Info
+                    with open(lrc_path, 'w', encoding='utf-8') as f: f.write(lyrics_text)
+        except Exception as e: print(f'Failed lyrics: {e}')
+
         quality = self.config.quality_tier
-        if progress_callback:
-            await progress_callback(0, 1, "Fetching stream URL...")
-            
+        if progress_callback: await progress_callback(0, 1, 'Fetching stream URL...')
         stream_info = await self.api.get_stream_info(track_id, quality)
-        ext = stream_info["extension"]
-        
-        filename = f"{track_num:02d} - {safe_title}.{ext}"
-        final_path = os.path.join(album_dir, filename)
-        temp_path = final_path + ".tmp"
+        ext = stream_info['extension']
+
+        rel_path_final = template.format(artist=safe_artist, album=safe_album, track_num=f'{track_num:02d}', title=safe_title, ext=ext)
+        rel_path_final = rel_path_final.replace('/', os.sep).replace('\\', os.sep)
+        final_path = os.path.join(base_dir, rel_path_final)
+        temp_path = final_path + '.tmp'
         
         # 3. Perform Download
         session = await self.api.get_session()
@@ -302,9 +303,24 @@ class DownloadManager:
             }
             await asyncio.to_thread(self.apply_metadata, final_path, ext, tags_dict)
             
+            spec_str = ""
+            bd = stream_info.get("bit_depth")
+            sr = stream_info.get("sample_rate")
+            if bd and sr:
+                sr_khz = f"{sr/1000:g}kHz"
+                spec_str = f" ({bd}-bit/{sr_khz} {ext.upper()})"
+            elif ext:
+                spec_str = f" ({ext.upper()})"
+
             if progress_callback:
-                await progress_callback(1, 1, "Completed")
-            return True
+                await progress_callback(1, 1, f"Completed{spec_str}")
+            return {
+                "final_path": final_path,
+                "spec_str": spec_str,
+                "bit_depth": bd,
+                "sample_rate": sr,
+                "extension": ext
+            }
             
         except Exception as e:
             # Clean up temp file on failure

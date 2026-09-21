@@ -29,15 +29,19 @@ def main():
     # Clean shutdown handler
     def on_closing():
         print("Closing application...")
+        # Let the app save its session data first
+        try:
+            app.on_closing_save_session()
+        except Exception as e:
+            print(f"Error saving session: {e}")
+        
         # Run cleanup synchronously in the async loop
         async def cleanup():
-            # Cancel all running tasks to prevent warnings
-            current_task = asyncio.current_task(async_loop)
-            tasks = [task for task in asyncio.all_tasks(async_loop) if task is not current_task]
+            current = asyncio.current_task()
+            tasks = [task for task in asyncio.all_tasks(async_loop) if task is not current]
             for task in tasks:
                 task.cancel()
             if tasks:
-                # Wait for all tasks to acknowledge cancellation
                 await asyncio.gather(*tasks, return_exceptions=True)
             await api.close()
         

@@ -4,9 +4,15 @@ import asyncio
 import threading
 import webbrowser
 import re
+import io
+import subprocess
+import winsound
 import customtkinter as CTk
 from tkinter import filedialog, messagebox
 from .downloader import DownloadManager
+import aiohttp
+from PIL import Image
+import imageio_ffmpeg
 
 CTk.set_appearance_mode("dark")
 CTk.set_default_color_theme("blue")
@@ -232,6 +238,50 @@ class LoginModal(CTk.CTkToplevel):
         self.status_label.configure(text="Link opened in browser!", text_color=COLOR_ACCENT)
 
 
+def format_specs(bit_depth, sample_rate, audio_quality="", audio_mode="STEREO"):
+    """Formats bit depth and sample rate into accurate dynamic badge text and color."""
+    if audio_mode == "DOLBY_ATMOS" or "ATMOS" in str(audio_mode).upper():
+        return "🔊 Dolby Atmos", "#9c27b0"
+    
+    sr_str = ""
+    if sample_rate:
+        sr_khz = sample_rate / 1000.0
+        sr_str = f"{sr_khz:g}kHz"
+    
+    if bit_depth and bit_depth >= 24:
+        text = f"🎵 MAX • {bit_depth}-bit/{sr_str}" if sr_str else f"🎵 MAX • {bit_depth}-bit"
+        return text, "#ffb300"
+    elif bit_depth == 16:
+        text = f"💿 HiFi • 16-bit/{sr_str}" if sr_str else "💿 HiFi • 16-bit/44.1kHz"
+        return text, "#1976d2"
+    elif "HIRES" in str(audio_quality).upper() or "HI_RES" in str(audio_quality).upper():
+        return "🎵 MAX (24-bit Hi-Res)", "#ffb300"
+    elif "LOSSLESS" in str(audio_quality).upper():
+        return "💿 HiFi (16-bit Lossless)", "#1976d2"
+    else:
+        return "Standard (AAC)", "#616161"
+
+
+def get_quality_badge(item):
+    """Returns initial (badge_text, badge_color) based on item's audioQuality, audioModes, and mediaMetadata tags."""
+    media_meta = item.get("mediaMetadata", {})
+    tags = media_meta.get("tags", []) if isinstance(media_meta, dict) else []
+    audio_quality = item.get("audioQuality", "")
+    audio_modes = item.get("audioModes", [])
+    
+    if "DOLBY_ATMOS" in audio_modes or "DOLBY_ATMOS" in tags:
+        return "🔊 Dolby Atmos", "#9c27b0"
+    elif "HIRES_LOSSLESS" in tags or audio_quality == "HI_RES_LOSSLESS":
+        return "🎵 MAX (24-bit Hi-Res)", "#ffb300"
+    elif "MQA" in tags:
+        return "🎵 MQA (Master)", "#00e5ff"
+    elif "LOSSLESS" in tags or audio_quality == "LOSSLESS":
+        return "💿 HiFi (16-bit/44.1kHz)", "#1976d2"
+    elif audio_quality in ("HIGH", "LOW"):
+        return "Standard (AAC)", "#616161"
+    return "", "#333333"
+
+
 class AppUI(CTk.CTk):
     """Main Application UI class running CustomTkinter."""
     
@@ -254,12 +304,21 @@ class AppUI(CTk.CTk):
         self.queue_order = []
         self.pending_downloads = []
         
+        # Image management (B2: prevent garbage collection, O2: caching)
+        self._image_refs = []
+        self._image_cache = {}
+        self._specs_cache = {}  # track_id -> (badge_text, badge_color)
+        
+        # Preview state
+        self.preview_proc = None
+        self.preview_tid = None
+        self.active_pbtn = None
+        
         # Create Layout
         self.setup_layout()
         
-        # Start 3 background worker tasks
-        for _ in range(3):
-            self.run_async(self.download_worker())
+        # Start ONE background worker (B3: single worker with shared semaphore)
+        self.run_async(self.download_worker())
         
         # Check login status
         self.check_login_status()
@@ -267,8 +326,8 @@ class AppUI(CTk.CTk):
         # Load saved session
         self.after(500, self.load_session)
 
-    def on_closing(self):
-        """Handle application close event to cancel downloads and save session."""
+    def on_closing_save_session(self):
+        """Saves pending downloads to session file (called by main.py on shutdown)."""
         try:
             session_data = []
             for tid in self.pending_downloads:
@@ -286,7 +345,19 @@ class AppUI(CTk.CTk):
                 json.dump(session_data, f, ensure_ascii=False)
         except Exception as e:
             print(f"Failed to save session: {e}")
-            
+        
+        # Clean up preview temp files (B7)
+        import glob
+        for pattern in ("preview_*.m4a", "preview_*.wav"):
+            try:
+                for fpath in glob.glob(os.path.join(self.config.download_directory, pattern)):
+                    os.remove(fpath)
+            except Exception:
+                pass
+
+    def on_closing(self):
+        """Handle application close event."""
+        self.on_closing_save_session()
         self.downloader.is_cancelled = True
         self.destroy()
 
@@ -314,6 +385,54 @@ class AppUI(CTk.CTk):
     def run_async(self, coro):
         """Helper to run a coroutine safely in the background event loop."""
         return asyncio.run_coroutine_threadsafe(coro, self.async_loop)
+
+    async def load_and_set_image(self, url, image_label):
+        """Loads a thumbnail image from URL, with caching and GC protection."""
+        if not url:
+            return
+        # O2: Return cached image if available
+        if url in self._image_cache:
+            ctk_img = self._image_cache[url]
+            self.after(0, lambda: image_label.configure(image=ctk_img, text=""))
+            return
+        try:
+            # O1: Reuse the shared API session instead of creating a new one
+            session = await self.api.get_session()
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    image = Image.open(io.BytesIO(data))
+                    ctk_img = CTk.CTkImage(light_image=image, dark_image=image, size=(70, 70))
+                    # B2: Store reference to prevent garbage collection
+                    self._image_refs.append(ctk_img)
+                    # O2: Cache for re-searches
+                    self._image_cache[url] = ctk_img
+                    self.after(0, lambda: image_label.configure(image=ctk_img, text=""))
+        except Exception as e:
+            print(f"Failed to load image {url}: {e}")
+
+    async def load_and_set_specs(self, track_id, badge_label):
+        """Asynchronously queries exact stream resolution (bit depth & sample rate) and updates badge dynamically."""
+        if not track_id or not badge_label:
+            return
+        if track_id in self._specs_cache:
+            text, color = self._specs_cache[track_id]
+            self.after(0, lambda: badge_label.configure(text=text, fg_color=color))
+            return
+            
+        try:
+            specs = await self.api.get_track_specs(track_id)
+            if specs and specs.get("bit_depth"):
+                text, color = format_specs(
+                    specs["bit_depth"], 
+                    specs["sample_rate"], 
+                    specs.get("audio_quality", ""),
+                    specs.get("audio_mode", "STEREO")
+                )
+                self._specs_cache[track_id] = (text, color)
+                self.after(0, lambda: badge_label.configure(text=text, fg_color=color))
+        except Exception as e:
+            pass
 
     def check_login_status(self):
         """Verifies session token on load."""
@@ -578,7 +697,6 @@ class AppUI(CTk.CTk):
             messagebox.showwarning("Login Required", "You must be logged in to search Tidal catalog.")
             return
             
-        self.results_scroll.winfo_children()
         for child in self.results_scroll.winfo_children():
             child.destroy()
             
@@ -652,11 +770,14 @@ class AppUI(CTk.CTk):
             return
             
         for idx, item in enumerate(items):
-            row = CTk.CTkFrame(self.results_scroll, fg_color="transparent", height=60)
+            row = CTk.CTkFrame(self.results_scroll, fg_color="transparent", height=90)
             row.pack(fill="x", pady=5, padx=5)
             row.pack_propagate(False)
             
-            # Text layout depending on category
+            image_url = None
+            quality_badge_text = ""
+            quality_badge_color = "#333333"
+
             btn_text = "Download"
             if search_type == "tracks":
                 title = item.get("title", "Unknown Title")
@@ -667,6 +788,13 @@ class AppUI(CTk.CTk):
                 display_text = f"{title}\nBy {artist} — {album}"
                 item_id = item["id"]
                 action_func = lambda i=item_id, t=title: self.queue_track_download(i, t)
+                
+                cover_id = album_info.get("cover")
+                if cover_id:
+                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
+                
+                quality_badge_text, quality_badge_color = get_quality_badge(item)
+                    
             elif search_type == "albums":
                 title = item.get("title", "Unknown Title")
                 artists = item.get("artists", [])
@@ -674,11 +802,23 @@ class AppUI(CTk.CTk):
                 display_text = f"Album: {title}\nBy {artist}"
                 item_id = item["id"]
                 action_func = lambda i=item_id, t=title: self.queue_album_downloads(i, t)
+                
+                cover_id = item.get("cover")
+                if cover_id:
+                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
+                    
+                quality_badge_text, quality_badge_color = get_quality_badge(item)
+                    
             elif search_type == "playlists":
                 title = item.get("title", "Unknown Title")
                 display_text = f"Playlist: {title}\nTracks: {item.get('numberOfTracks', 'Unknown')}"
                 item_id = item["uuid"]
                 action_func = lambda i=item_id, t=title: self.queue_playlist_downloads(i, t)
+                
+                cover_id = item.get("squareImage")
+                if cover_id:
+                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
+                    
             elif search_type == "artists":
                 name = item["name"]
                 display_text = f"Artist: {name}"
@@ -686,9 +826,123 @@ class AppUI(CTk.CTk):
                 action_func = lambda i=item_id: self.trigger_artist_albums_search(i)
                 btn_text = "View Albums"
                 
-            info_lbl = CTk.CTkLabel(row, text=display_text, font=CTk.CTkFont(size=12), anchor="w", justify="left")
-            info_lbl.pack(side="left", fill="both", expand=True, padx=10)
+                cover_id = item.get("picture")
+                if cover_id:
+                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
+                    
+            img_lbl = CTk.CTkLabel(row, text="Loading...", width=70, height=70, fg_color="#222222")
+            img_lbl.pack(side="left", padx=(0, 10))
             
+            if image_url:
+                self.run_async(self.load_and_set_image(image_url, img_lbl))
+            else:
+                img_lbl.configure(text="No Image")
+                
+            text_frame = CTk.CTkFrame(row, fg_color="transparent")
+            text_frame.pack(side="left", fill="both", expand=True)
+            
+            info_lbl = CTk.CTkLabel(text_frame, text=display_text, font=CTk.CTkFont(size=12), anchor="w", justify="left")
+            info_lbl.pack(anchor="w", pady=(5, 5))
+            
+            if quality_badge_text:
+                badge = CTk.CTkLabel(text_frame, text=quality_badge_text, font=CTk.CTkFont(size=10, weight="bold"), text_color="black", fg_color=quality_badge_color, corner_radius=4, padx=5, height=20)
+                badge.pack(anchor="w")
+            
+            if search_type == 'tracks':
+                def toggle_preview(tid=item_id, pbtn=None):
+                    # Stop current playback
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                    if self.preview_proc is not None:
+                        try:
+                            if self.preview_proc.poll() is None:
+                                self.preview_proc.terminate()
+                                self.preview_proc.wait(timeout=2)
+                        except Exception:
+                            pass
+                    
+                    # Reset previous button
+                    if self.active_pbtn and self.active_pbtn is not pbtn:
+                        try:
+                            self.active_pbtn.configure(text='▶')
+                        except Exception:
+                            pass
+                        
+                    # Toggle: if same track, stop
+                    if self.preview_tid == tid:
+                        self.preview_tid = None
+                        self.active_pbtn = None
+                        pbtn.configure(text='▶')
+                        # Increment generation to signal any running thread to abort
+                        self._preview_gen = getattr(self, '_preview_gen', 0) + 1
+                        return
+                        
+                    pbtn.configure(text='⏳')
+                    self.preview_tid = tid
+                    self.active_pbtn = pbtn
+                    # Increment generation so old threads know to abort
+                    self._preview_gen = getattr(self, '_preview_gen', 0) + 1
+                    my_gen = self._preview_gen
+                    
+                    def play_stream():
+                        try:
+                            # Use track-specific temp files to avoid overwrite conflicts
+                            tmp_m4a = os.path.join(self.config.download_directory, f"preview_{tid}.m4a")
+                            tmp_wav = os.path.join(self.config.download_directory, f"preview_{tid}.wav")
+                            os.makedirs(self.config.download_directory, exist_ok=True)
+                            
+                            # Check if we already have cached WAV for this track
+                            if not (os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000):
+                                # Download audio segments
+                                async def fetch_audio():
+                                    info = await self.api.get_stream_info(tid, 'LOW')
+                                    session = await self.api.get_session()
+                                    with open(tmp_m4a, "wb") as f:
+                                        if info['type'] == 'direct':
+                                            async with session.get(info['url']) as resp:
+                                                f.write(await resp.content.read(1024 * 500))
+                                        else:
+                                            async with session.get(info['init_url']) as resp:
+                                                f.write(await resp.read())
+                                            for seg in info.get('segment_urls', [])[:3]:
+                                                async with session.get(seg) as resp:
+                                                    f.write(await resp.read())
+                                    return tmp_m4a
+                                    
+                                future = asyncio.run_coroutine_threadsafe(fetch_audio(), self.async_loop)
+                                future.result(timeout=30)
+                                
+                                # Abort if user switched to another track
+                                if self._preview_gen != my_gen:
+                                    return
+                                
+                                # Convert to WAV
+                                ff_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                                self.preview_proc = subprocess.Popen(
+                                    [ff_exe, "-y", "-i", tmp_m4a, "-f", "wav", tmp_wav],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                                )
+                                self.preview_proc.wait()
+                                
+                                # Clean up m4a temp
+                                try:
+                                    os.remove(tmp_m4a)
+                                except Exception:
+                                    pass
+                            
+                            # Final abort check before playing
+                            if self._preview_gen != my_gen:
+                                return
+                            
+                            if os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000:
+                                self.after(0, lambda: pbtn.configure(text='⏹'))
+                                winsound.PlaySound(tmp_wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                            else:
+                                self.after(0, lambda: pbtn.configure(text='▶'))
+                        except Exception as e:
+                            print('Preview error', e)
+                            self.after(0, lambda: pbtn.configure(text='▶'))
+                            
+                    threading.Thread(target=play_stream, daemon=True).start()
             dl_btn = CTk.CTkButton(
                 row, 
                 text=btn_text, 
@@ -699,9 +953,12 @@ class AppUI(CTk.CTk):
                 font=CTk.CTkFont(size=11, weight="bold"),
                 command=action_func
             )
-            dl_btn.pack(side="right", padx=10, pady=15)
+            dl_btn.pack(side="right", padx=10, pady=25)
+            if search_type == 'tracks':
+                pbtn = CTk.CTkButton(row, text='▶', width=30, fg_color='#444', hover_color='#666')
+                pbtn.configure(command=lambda p=pbtn, t=item_id: toggle_preview(tid=t, pbtn=p))
+                pbtn.pack(side="right", padx=5, pady=25)
             
-            # Divider
             divider = CTk.CTkFrame(self.results_scroll, fg_color="#333333", height=1)
             divider.pack(fill="x", padx=5)
 
@@ -943,18 +1200,19 @@ class AppUI(CTk.CTk):
             self.after(0, lambda: messagebox.showerror("Playlist Error", f"Failed to download playlist tracks: {err_msg}"))
 
     async def download_worker(self):
-        """Continuously pulls from pending_downloads and processes them."""
+        max_c = getattr(self.config, 'concurrent_downloads', 3)
+        sem = asyncio.Semaphore(max_c)
+        async def worker_task(tid):
+            async with sem:
+                if self.queue_items[tid]['status'] == 'cancelled' or self.queue_items[tid]['task_state']['is_cancelled']:
+                    return
+                await self.process_single_download(tid)
         while not self.downloader.is_cancelled:
             if not self.pending_downloads:
                 await asyncio.sleep(0.5)
                 continue
-                
             track_id = self.pending_downloads.pop(0)
-            
-            if self.queue_items[track_id]["status"] == "cancelled" or self.queue_items[track_id]["task_state"]["is_cancelled"]:
-                continue
-                
-            await self.process_single_download(track_id)
+            asyncio.create_task(worker_task(track_id))
 
     async def process_single_download(self, tid):
         """Processes a single download task."""
@@ -973,11 +1231,13 @@ class AppUI(CTk.CTk):
         try:
             parent_folder = self.queue_items[tid].get("parent_folder")
             task_state = self.queue_items[tid].get("task_state")
-            await self.downloader.download_track(tid, make_callback(tid), parent_folder, task_state)
+            res = await self.downloader.download_track(tid, make_callback(tid), parent_folder, task_state)
             if tid in self.queue_items:
                 self.queue_items[tid]["status"] = "completed"
+                spec_text = res.get("spec_str", "") if isinstance(res, dict) else ""
+                completed_msg = f"Completed{spec_text}" if spec_text else "Completed"
                 self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#4caf50") if nid in self.queue_items else None)
-                self.after(0, lambda nid=tid: self.queue_items[nid]["status_lbl"].configure(text="Completed") if nid in self.queue_items else None)
+                self.after(0, lambda nid=tid, msg=completed_msg: self.queue_items[nid]["status_lbl"].configure(text=msg) if nid in self.queue_items else None)
                 self.after(0, self.update_queue_summary)
         except Exception as e:
             print(f"Download failed for track {tid}: {e}")
@@ -1051,6 +1311,21 @@ class AppUI(CTk.CTk):
             self.atmos_switch.select()
         else:
             self.atmos_switch.deselect()
+        lbl_t = CTk.CTkLabel(self.settings_view, text='File Naming Template', font=CTk.CTkFont(size=13, weight='bold'))
+        lbl_t.pack(anchor="w", pady=(5, 5))
+        self.template_entry = CTk.CTkEntry(self.settings_view, width=300, height=35)
+        self.template_entry.pack(anchor="w", pady=(0, 20))
+        self.template_entry.insert(0, getattr(self.config, 'file_template', '{album}/{track_num} - {title}.{ext}'))
+        lbl_c = CTk.CTkLabel(self.settings_view, text='Concurrent Downloads (1-3)', font=CTk.CTkFont(size=13, weight='bold'))
+        lbl_c.pack(anchor="w", pady=(5, 5))
+        slider_frame = CTk.CTkFrame(self.settings_view, fg_color="transparent")
+        slider_frame.pack(anchor="w", pady=(0, 20))
+        self.concurrent_slider = CTk.CTkSlider(slider_frame, from_=1, to=3, number_of_steps=2, width=250)
+        self.concurrent_slider.pack(side="left")
+        self.concurrent_value_lbl = CTk.CTkLabel(slider_frame, text=str(int(getattr(self.config, 'concurrent_downloads', 3))), font=CTk.CTkFont(size=14, weight="bold"), text_color=COLOR_ACCENT, width=30)
+        self.concurrent_value_lbl.pack(side="left", padx=10)
+        self.concurrent_slider.configure(command=lambda v: self.concurrent_value_lbl.configure(text=str(int(v))))
+        self.concurrent_slider.set(getattr(self.config, 'concurrent_downloads', 3))
         
         # Browser Selection
         browser_lbl = CTk.CTkLabel(self.settings_view, text="Login Browser Selection", font=CTk.CTkFont(size=13, weight="bold"))
@@ -1103,6 +1378,8 @@ class AppUI(CTk.CTk):
         new_quality = self.quality_map.get(self.quality_menu.get(), "LOSSLESS")
         new_browser = self.browser_menu.get()
         new_atmos = bool(self.atmos_switch.get())
+        new_concurrent = int(self.concurrent_slider.get())
+        new_template = self.template_entry.get().strip()
         new_id = self.client_id_entry.get().strip()
         new_secret = self.client_secret_entry.get().strip()
         
@@ -1118,6 +1395,8 @@ class AppUI(CTk.CTk):
         self.config.quality_tier = new_quality
         self.config.login_browser = new_browser
         self.config.allow_dolby_atmos = new_atmos
+        self.config.concurrent_downloads = new_concurrent
+        self.config.file_template = new_template
         
         # Check if keys changed
         keys_changed = (self.config.client_id != new_id or self.config.client_secret != new_secret)

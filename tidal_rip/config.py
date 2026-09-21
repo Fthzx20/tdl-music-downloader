@@ -38,9 +38,11 @@ class Config:
         self.user_id = ""
         self.user_name = ""
         self.download_directory = os.path.expanduser("~/Music/Tidal Downloads")
-        self.quality_tier = "LOSSLESS"  # Options: LOW, HIGH, LOSSLESS, MAX
+        self.quality_tier = "HI_RES_LOSSLESS"  # Options: LOW, HIGH, LOSSLESS, HI_RES_LOSSLESS
         self.login_browser = "Default Browser"
         self.allow_dolby_atmos = False
+        self.concurrent_downloads = 3
+        self.file_template = "{album}/{track_num} - {title}.{ext}"
         
         self.load()
 
@@ -74,9 +76,11 @@ class Config:
             self.user_id = data.get("user_id", "")
             self.user_name = data.get("user_name", "")
             self.download_directory = data.get("download_directory", os.path.expanduser("~/Music/Tidal Downloads"))
-            self.quality_tier = data.get("quality_tier", "LOSSLESS")
+            self.quality_tier = data.get("quality_tier", "HI_RES_LOSSLESS")
             self.login_browser = data.get("login_browser", "Default Browser")
             self.allow_dolby_atmos = data.get("allow_dolby_atmos", False)
+            self.concurrent_downloads = data.get("concurrent_downloads", 3)
+            self.file_template = data.get("file_template", "{album}/{track_num} - {title}.{ext}")
         except Exception as e:
             print(f"Error loading configuration: {e}")
 
@@ -94,7 +98,9 @@ class Config:
             "download_directory": self.download_directory,
             "quality_tier": self.quality_tier,
             "login_browser": self.login_browser,
-            "allow_dolby_atmos": self.allow_dolby_atmos
+            "allow_dolby_atmos": self.allow_dolby_atmos,
+            "concurrent_downloads": self.concurrent_downloads,
+            "file_template": self.file_template
         }
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
