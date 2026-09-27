@@ -8,6 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 import urllib.parse
 import aiohttp
+import re
 
 class TidalAPI:
     """Asynchronous client for interacting with the Tidal API."""
@@ -212,15 +213,61 @@ class TidalAPI:
 
     # --- Search & Metadata Methods ---
 
-    async def search(self, query, limit=30, offset=0):
+    async def search(self, query, limit=30, offset=0, types=None):
         """Searches Tidal catalog for tracks, albums, playlists, and artists."""
+        if not types:
+            types = "TRACKS,ALBUMS,PLAYLISTS,ARTISTS"
         params = {
             "query": query,
             "limit": limit,
             "offset": offset,
-            "types": "TRACKS,ALBUMS,PLAYLISTS,ARTISTS"
+            "types": types
         }
         return await self._api_request("GET", "search", params=params)
+
+    async def smart_search(self, query, search_type="tracks", limit=30):
+        """Intelligent search that optimizes category filtering, cleans noise, and executes fallbacks."""
+        type_map = {
+            "tracks": "TRACKS",
+            "albums": "ALBUMS",
+            "playlists": "PLAYLISTS",
+            "artists": "ARTISTS"
+        }
+        clean_st = search_type.lower()
+        target_type = type_map.get(clean_st, "TRACKS,ALBUMS,PLAYLISTS,ARTISTS")
+        clean_q = query.strip()
+        
+        # 1. Primary search with user query
+        try:
+            res = await self.search(clean_q, limit=limit, types=target_type)
+            if clean_st in res and len(res[clean_st].get("items", [])) > 0:
+                return res
+        except Exception:
+            res = {}
+
+        # 2. Query cleaning fallback (removes brackets, video tags, extra feat/ft noise)
+        def clean_text(q):
+            t = re.sub(r'[\(\[][^\)\]]*(?:feat|ft|remaster|radio|edit|version|mix|official|video|audio|deluxe|bonus|live)[^\)\]]*[\)\]]', '', q, flags=re.I)
+            t = re.sub(r'\b(?:feat\.?|ft\.?)\s+[^\-]+', '', t, flags=re.I)
+            t = re.sub(r'[^\w\s\-\'\,\.]', ' ', t)
+            t = re.sub(r'\s+', ' ', t).strip()
+            return t
+            
+        cleaned = clean_text(clean_q)
+        if cleaned and cleaned.lower() != clean_q.lower():
+            try:
+                fallback_res = await self.search(cleaned, limit=limit, types=target_type)
+                if clean_st in fallback_res and len(fallback_res[clean_st].get("items", [])) > 0:
+                    return fallback_res
+            except Exception:
+                pass
+                
+        # 3. Broad multi-category fallback
+        try:
+            broad_res = await self.search(cleaned or clean_q, limit=limit, types="TRACKS,ALBUMS,PLAYLISTS,ARTISTS")
+            return broad_res
+        except Exception:
+            return res
 
     async def get_track(self, track_id):
         """Gets metadata for a specific track."""
@@ -333,8 +380,14 @@ class TidalAPI:
                 ext = "m4a"
             elif "ec-3" in codec or "ac-4" in codec:
                 if not getattr(self.config, "allow_dolby_atmos", False):
-                    print("Dolby Atmos detected but disallowed by settings. Falling back to LOSSLESS stereo FLAC.")
-                    return await self.get_stream_info(track_id, "LOSSLESS")
+                    preferred = getattr(self.config, "quality_tier", "HI_RES_LOSSLESS")
+                    # Fallback to the highest tier besides Atmos (HI_RES_LOSSLESS -> LOSSLESS)
+                    fallback_tier = "HI_RES_LOSSLESS" if preferred == "HI_RES_LOSSLESS" else "LOSSLESS"
+                    print(f"Dolby Atmos ({codec}) detected but disallowed by settings. Falling back to top stereo tier ({fallback_tier}).")
+                    try:
+                        return await self.get_stream_info(track_id, fallback_tier)
+                    except Exception:
+                        return await self.get_stream_info(track_id, "LOSSLESS")
                 ext = "m4a"
                 
             return {

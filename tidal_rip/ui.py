@@ -13,6 +13,7 @@ from .downloader import DownloadManager
 import aiohttp
 from PIL import Image
 import imageio_ffmpeg
+from .link_resolver import is_external_music_link, resolve_external_link
 
 CTk.set_appearance_mode("dark")
 CTk.set_default_color_theme("blue")
@@ -148,7 +149,7 @@ def parse_tidal_url(query):
         return "playlist", uuid_match.group(1)
         
     patterns = {
-        "track": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?track/(\d+)",
+        "track": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?(?:album/\d+/)?track/(\d+)",
         "album": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?album/(\d+)",
         "playlist": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?playlist/([a-zA-Z0-9-]+)",
         "artist": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?artist/(\d+)"
@@ -157,6 +158,11 @@ def parse_tidal_url(query):
         match = re.search(pattern, query)
         if match:
             return item_type, match.group(1)
+            
+    # Also support raw digits as track ID if query is purely numeric
+    if query.isdigit() and len(query) >= 5:
+        return "track", query
+        
     return None, None
 
 class LoginModal(CTk.CTkToplevel):
@@ -387,13 +393,21 @@ class AppUI(CTk.CTk):
         return asyncio.run_coroutine_threadsafe(coro, self.async_loop)
 
     async def load_and_set_image(self, url, image_label):
-        """Loads a thumbnail image from URL, with caching and GC protection."""
+        """Loads a thumbnail image from URL, with caching, GC protection, and safe widget checks."""
         if not url:
             return
+            
+        def safe_set(ctk_img):
+            try:
+                if image_label.winfo_exists():
+                    image_label.configure(image=ctk_img, text="")
+            except Exception:
+                pass
+
         # O2: Return cached image if available
         if url in self._image_cache:
             ctk_img = self._image_cache[url]
-            self.after(0, lambda: image_label.configure(image=ctk_img, text=""))
+            self.after(0, lambda: safe_set(ctk_img))
             return
         try:
             # O1: Reuse the shared API session instead of creating a new one
@@ -407,7 +421,7 @@ class AppUI(CTk.CTk):
                     self._image_refs.append(ctk_img)
                     # O2: Cache for re-searches
                     self._image_cache[url] = ctk_img
-                    self.after(0, lambda: image_label.configure(image=ctk_img, text=""))
+                    self.after(0, lambda: safe_set(ctk_img))
         except Exception as e:
             print(f"Failed to load image {url}: {e}")
 
@@ -415,9 +429,17 @@ class AppUI(CTk.CTk):
         """Asynchronously queries exact stream resolution (bit depth & sample rate) and updates badge dynamically."""
         if not track_id or not badge_label:
             return
+            
+        def safe_set_badge(text, color):
+            try:
+                if badge_label.winfo_exists():
+                    badge_label.configure(text=text, fg_color=color)
+            except Exception:
+                pass
+
         if track_id in self._specs_cache:
             text, color = self._specs_cache[track_id]
-            self.after(0, lambda: badge_label.configure(text=text, fg_color=color))
+            self.after(0, lambda: safe_set_badge(text, color))
             return
             
         try:
@@ -430,7 +452,7 @@ class AppUI(CTk.CTk):
                     specs.get("audio_mode", "STEREO")
                 )
                 self._specs_cache[track_id] = (text, color)
-                self.after(0, lambda: badge_label.configure(text=text, fg_color=color))
+                self.after(0, lambda: safe_set_badge(text, color))
         except Exception as e:
             pass
 
@@ -665,7 +687,7 @@ class AppUI(CTk.CTk):
         search_ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 15))
         search_ctrl.grid_columnconfigure(0, weight=1)
         
-        self.search_entry = CTk.CTkEntry(search_ctrl, placeholder_text="Search terms, Tidal URL, or Playlist UUID...", height=40, font=CTk.CTkFont(size=14))
+        self.search_entry = CTk.CTkEntry(search_ctrl, placeholder_text="Search terms, Tidal / Spotify / Apple Music / YouTube URL...", height=40, font=CTk.CTkFont(size=14))
         self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.search_entry.bind("<Return>", lambda e: self.trigger_search())
         
@@ -688,6 +710,12 @@ class AppUI(CTk.CTk):
         self.results_scroll = CTk.CTkScrollableFrame(self.search_view, fg_color=COLOR_FRAME_BG)
         self.results_scroll.grid(row=1, column=0, sticky="nsew")
 
+    def show_search_status(self, text):
+        for child in self.results_scroll.winfo_children():
+            child.destroy()
+        lbl = CTk.CTkLabel(self.results_scroll, text=text, font=CTk.CTkFont(size=14, slant="italic"), justify="center")
+        lbl.pack(pady=40)
+
     def trigger_search(self):
         query = self.search_entry.get().strip()
         if not query:
@@ -697,26 +725,56 @@ class AppUI(CTk.CTk):
             messagebox.showwarning("Login Required", "You must be logged in to search Tidal catalog.")
             return
             
-        for child in self.results_scroll.winfo_children():
-            child.destroy()
-            
-        # Loading indicator
-        lbl = CTk.CTkLabel(self.results_scroll, text="Searching Tidal...", font=CTk.CTkFont(size=14, slant="italic"))
-        lbl.pack(pady=40)
+        self.show_search_status("Searching Tidal catalog...")
         
         search_type = self.search_type_menu.get().lower()
         self.run_async(self.perform_search(query, search_type))
 
-    def trigger_artist_albums_search(self, artist_id):
-        """Helper that populates search bar with the artist's URL to retrieve all their albums."""
-        url = f"https://tidal.com/artist/{artist_id}"
+    def trigger_artist_albums_search(self, artist_id, artist_name=""):
+        """Directly retrieves and displays all catalog albums for an artist."""
         self.search_entry.delete(0, "end")
-        self.search_entry.insert(0, url)
+        self.search_entry.insert(0, f"https://tidal.com/artist/{artist_id}")
         self.search_type_menu.set("Albums")
-        self.trigger_search()
+        
+        lbl_text = f"Fetching albums for {artist_name}..." if artist_name else "Fetching artist albums..."
+        self.show_search_status(lbl_text)
+        
+        async def fetch_albums():
+            try:
+                albums_resp = await self.api.get_artist_albums(artist_id)
+                self.after(0, self.populate_results, albums_resp, "albums")
+            except Exception as e:
+                err_msg = str(e)
+                self.after(0, lambda: messagebox.showerror("Artist Albums Error", f"Failed to retrieve albums: {err_msg}"))
+                
+        self.run_async(fetch_albums())
 
     async def perform_search(self, query, search_type):
-        # 1. Support direct URL link routing for quick fetching
+        query = query.strip()
+        
+        # 1. External music links (Spotify, Apple Music, YouTube Music, Deezer, SoundCloud)
+        if is_external_music_link(query):
+            self.after(0, lambda: self.show_search_status("Resolving external link (Spotify / Apple Music / YouTube)..."))
+            resolved_query, resolved_type, display_info, service_name = await resolve_external_link(query)
+            if resolved_query:
+                if resolved_type:
+                    self.after(0, lambda t=resolved_type.capitalize(): self.search_type_menu.set(t))
+                    search_type = resolved_type
+                
+                self.after(0, lambda info=display_info, svc=service_name: self.show_search_status(f"Found on {svc}: {info}\nSearching Tidal catalog..."))
+                
+                try:
+                    results = await self.api.smart_search(resolved_query, search_type=search_type, limit=50)
+                    self.after(0, self.populate_results, results, search_type)
+                except Exception as e:
+                    err_msg = str(e)
+                    self.after(0, lambda: messagebox.showerror("Search Error", f"Search request failed: {err_msg}"))
+                return
+            else:
+                self.after(0, lambda: messagebox.showwarning("Link Unresolved", "Could not extract song/album metadata from this link. Please check the URL."))
+                return
+
+        # 2. Tidal direct URL link routing
         url_type, url_id = parse_tidal_url(query)
         if url_type:
             try:
@@ -733,7 +791,6 @@ class AppUI(CTk.CTk):
                     results = {"playlists": {"items": [playlist]}}
                     self.after(0, self.populate_results, results, "playlists")
                 elif url_type == "artist":
-                    # Directly display the singer's catalog albums
                     albums_resp = await self.api.get_artist_albums(url_id)
                     self.after(0, self.populate_results, albums_resp, "albums")
             except Exception as e:
@@ -741,9 +798,9 @@ class AppUI(CTk.CTk):
                 self.after(0, lambda: messagebox.showerror("Link Search Error", f"Failed to retrieve link metadata: {err_msg}"))
             return
 
-        # 2. Standard string search query
+        # 3. High-quality smart string search
         try:
-            results = await self.api.search(query)
+            results = await self.api.smart_search(query, search_type=search_type, limit=50)
             self.after(0, self.populate_results, results, search_type)
         except Exception as e:
             err_msg = str(e)
@@ -755,7 +812,9 @@ class AppUI(CTk.CTk):
             child.destroy()
             
         items = []
-        if search_type == "tracks" and "tracks" in data:
+        if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+            items = data["items"]
+        elif search_type == "tracks" and "tracks" in data:
             items = data["tracks"].get("items", [])
         elif search_type == "albums" and "albums" in data:
             items = data["albums"].get("items", [])
@@ -820,10 +879,10 @@ class AppUI(CTk.CTk):
                     image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
                     
             elif search_type == "artists":
-                name = item["name"]
+                name = item.get("name", "Unknown Artist")
                 display_text = f"Artist: {name}"
                 item_id = item["id"]
-                action_func = lambda i=item_id: self.trigger_artist_albums_search(i)
+                action_func = lambda i=item_id, n=name: self.trigger_artist_albums_search(i, n)
                 btn_text = "View Albums"
                 
                 cover_id = item.get("picture")
@@ -933,14 +992,21 @@ class AppUI(CTk.CTk):
                             if self._preview_gen != my_gen:
                                 return
                             
+                            def safe_pbtn(txt):
+                                try:
+                                    if pbtn.winfo_exists():
+                                        pbtn.configure(text=txt)
+                                except Exception:
+                                    pass
+
                             if os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000:
-                                self.after(0, lambda: pbtn.configure(text='⏹'))
+                                self.after(0, lambda: safe_pbtn('⏹'))
                                 winsound.PlaySound(tmp_wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
                             else:
-                                self.after(0, lambda: pbtn.configure(text='▶'))
+                                self.after(0, lambda: safe_pbtn('▶'))
                         except Exception as e:
                             print('Preview error', e)
-                            self.after(0, lambda: pbtn.configure(text='▶'))
+                            self.after(0, lambda: safe_pbtn('▶'))
                             
                     threading.Thread(target=play_stream, daemon=True).start()
             dl_btn = CTk.CTkButton(
@@ -1222,9 +1288,16 @@ class AppUI(CTk.CTk):
             async def progress_update(downloaded, total, status_text):
                 progress = float(downloaded) / max(1.0, float(total))
                 def safe_update():
-                    if tid in self.queue_items:
-                        self.queue_items[tid]["progress_bar"].set(progress)
-                        self.queue_items[tid]["status_lbl"].configure(text=status_text)
+                    try:
+                        if tid in self.queue_items:
+                            pb = self.queue_items[tid].get("progress_bar")
+                            sl = self.queue_items[tid].get("status_lbl")
+                            if pb and pb.winfo_exists():
+                                pb.set(progress)
+                            if sl and sl.winfo_exists():
+                                sl.configure(text=status_text)
+                    except Exception:
+                        pass
                 self.after(0, safe_update)
             return progress_update
             
@@ -1236,16 +1309,38 @@ class AppUI(CTk.CTk):
                 self.queue_items[tid]["status"] = "completed"
                 spec_text = res.get("spec_str", "") if isinstance(res, dict) else ""
                 completed_msg = f"Completed{spec_text}" if spec_text else "Completed"
-                self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#4caf50") if nid in self.queue_items else None)
-                self.after(0, lambda nid=tid, msg=completed_msg: self.queue_items[nid]["status_lbl"].configure(text=msg) if nid in self.queue_items else None)
+                def safe_complete(nid=tid, msg=completed_msg):
+                    try:
+                        if nid in self.queue_items:
+                            pb = self.queue_items[nid].get("progress_bar")
+                            sl = self.queue_items[nid].get("status_lbl")
+                            if pb and pb.winfo_exists():
+                                pb.configure(progress_color="#4caf50")
+                            if sl and sl.winfo_exists():
+                                sl.configure(text=msg)
+                    except Exception:
+                        pass
+                self.after(0, safe_complete)
                 self.after(0, self.update_queue_summary)
         except Exception as e:
             print(f"Download failed for track {tid}: {e}")
             if tid in self.queue_items:
                 self.queue_items[tid]["status"] = "failed"
-                self.after(0, lambda nid=tid: self.queue_items[nid]["progress_bar"].configure(progress_color="#f44336") if nid in self.queue_items else None)
-                self.after(0, lambda nid=tid: self.queue_items[nid]["status_lbl"].configure(text="Failed", text_color="#f44336") if nid in self.queue_items else None)
-                self.after(0, lambda nid=tid: self.queue_items[nid]["retry_btn"].pack(side="left", padx=2) if nid in self.queue_items else None)
+                def safe_failed(nid=tid):
+                    try:
+                        if nid in self.queue_items:
+                            pb = self.queue_items[nid].get("progress_bar")
+                            sl = self.queue_items[nid].get("status_lbl")
+                            rb = self.queue_items[nid].get("retry_btn")
+                            if pb and pb.winfo_exists():
+                                pb.configure(progress_color="#f44336")
+                            if sl and sl.winfo_exists():
+                                sl.configure(text="Failed", text_color="#f44336")
+                            if rb and rb.winfo_exists():
+                                rb.pack(side="left", padx=2)
+                    except Exception:
+                        pass
+                self.after(0, safe_failed)
                 self.after(0, self.update_queue_summary)
 
     # --- Settings View ---
