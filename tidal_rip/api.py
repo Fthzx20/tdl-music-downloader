@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 import urllib.parse
 import aiohttp
 import re
+import unicodedata
 
 class TidalAPI:
     """Asynchronous client for interacting with the Tidal API."""
@@ -22,9 +23,11 @@ class TidalAPI:
         self.country_code = "US"  # Default fallback
 
     async def get_session(self):
-        """Lazy-loaded aiohttp client session."""
+        """Lazy-loaded aiohttp client session with TCP connection pooling and keepalive."""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(limit=50, keepalive_timeout=60, enable_cleanup_closed=True)
+            timeout = aiohttp.ClientTimeout(total=60, sock_connect=15)
+            self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self.session
 
     async def close(self):
@@ -226,7 +229,7 @@ class TidalAPI:
         return await self._api_request("GET", "search", params=params)
 
     async def smart_search(self, query, search_type="tracks", limit=30):
-        """Intelligent search that optimizes category filtering, cleans noise, and executes fallbacks."""
+        """Intelligent search that optimizes category filtering, handles diacritics/accents, permutation fallbacks, and cross-category recovery."""
         type_map = {
             "tracks": "TRACKS",
             "albums": "ALBUMS",
@@ -237,7 +240,7 @@ class TidalAPI:
         target_type = type_map.get(clean_st, "TRACKS,ALBUMS,PLAYLISTS,ARTISTS")
         clean_q = query.strip()
         
-        # 1. Primary search with user query
+        # 1. Primary search with direct user query
         try:
             res = await self.search(clean_q, limit=limit, types=target_type)
             if clean_st in res and len(res[clean_st].get("items", [])) > 0:
@@ -245,29 +248,92 @@ class TidalAPI:
         except Exception:
             res = {}
 
-        # 2. Query cleaning fallback (removes brackets, video tags, extra feat/ft noise)
+        # Helpers
+        def strip_accents(text):
+            return "".join(
+                c for c in unicodedata.normalize("NFD", text)
+                if unicodedata.category(c) != "Mn"
+            )
+
         def clean_text(q):
             t = re.sub(r'[\(\[][^\)\]]*(?:feat|ft|remaster|radio|edit|version|mix|official|video|audio|deluxe|bonus|live)[^\)\]]*[\)\]]', '', q, flags=re.I)
             t = re.sub(r'\b(?:feat\.?|ft\.?)\s+[^\-]+', '', t, flags=re.I)
             t = re.sub(r'[^\w\s\-\'\,\.]', ' ', t)
             t = re.sub(r'\s+', ' ', t).strip()
             return t
-            
+
+        # Generate candidates in priority order
+        candidates = []
+        
+        # A. Diacritics/Accents normalized version (e.g. "Björk" <-> "Bjork", "Rosalía" <-> "Rosalia")
+        unaccented = strip_accents(clean_q)
+        if unaccented.lower() != clean_q.lower():
+            candidates.append(unaccented)
+
+        # B. Cleaned text without noise/brackets
         cleaned = clean_text(clean_q)
-        if cleaned and cleaned.lower() != clean_q.lower():
+        if cleaned and cleaned.lower() not in [clean_q.lower(), unaccented.lower()]:
+            candidates.append(cleaned)
+            cleaned_unaccented = strip_accents(cleaned)
+            if cleaned_unaccented.lower() not in [c.lower() for c in candidates]:
+                candidates.append(cleaned_unaccented)
+
+        # C. Sub-phrase permutations: handle "Artist - Title" vs "Title Artist"
+        for base in [clean_q, cleaned] if cleaned != clean_q else [clean_q]:
+            if " - " in base:
+                left, right = [p.strip() for p in base.split(" - ", 1)]
+                candidates.append(f"{left} {right}")
+                candidates.append(f"{right} {left}")
+                candidates.append(right)
+                candidates.append(left)
+            elif " by " in base.lower():
+                m = re.split(r"\s+by\s+", base, flags=re.I, maxsplit=1)
+                if len(m) == 2:
+                    t_part, a_part = m[0].strip(), m[1].strip()
+                    candidates.append(f"{a_part} {t_part}")
+                    candidates.append(f"{t_part} {a_part}")
+                    candidates.append(t_part)
+
+        # Try candidates in sequence
+        seen_cand = {clean_q.lower()}
+        for cand in candidates:
+            if not cand or cand.lower() in seen_cand:
+                continue
+            seen_cand.add(cand.lower())
             try:
-                fallback_res = await self.search(cleaned, limit=limit, types=target_type)
-                if clean_st in fallback_res and len(fallback_res[clean_st].get("items", [])) > 0:
-                    return fallback_res
+                cand_res = await self.search(cand, limit=limit, types=target_type)
+                if clean_st in cand_res and len(cand_res[clean_st].get("items", [])) > 0:
+                    return cand_res
             except Exception:
                 pass
-                
+
         # 3. Broad multi-category fallback
         try:
-            broad_res = await self.search(cleaned or clean_q, limit=limit, types="TRACKS,ALBUMS,PLAYLISTS,ARTISTS")
-            return broad_res
+            broad_query = cleaned or unaccented or clean_q
+            broad_res = await self.search(broad_query, limit=limit, types="TRACKS,ALBUMS,PLAYLISTS,ARTISTS")
+            if clean_st in broad_res and len(broad_res[clean_st].get("items", [])) > 0:
+                return broad_res
+
+            # 4. Cross-category recovery:
+            # If user wanted albums but 0 albums found, extract albums from matching tracks
+            if clean_st == "albums" and "tracks" in broad_res and len(broad_res["tracks"].get("items", [])) > 0:
+                seen_album_ids = set()
+                recovered_albums = []
+                for trk in broad_res["tracks"]["items"]:
+                    alb = trk.get("album")
+                    if alb and alb.get("id") and alb["id"] not in seen_album_ids:
+                        seen_album_ids.add(alb["id"])
+                        recovered_albums.append(alb)
+                if recovered_albums:
+                    return {"albums": {"items": recovered_albums, "totalNumberOfItems": len(recovered_albums)}}
+
+            # If user wanted tracks and 0 found, but any other category matched, return broad
+            if any(len(broad_res.get(k, {}).get("items", [])) > 0 for k in ["tracks", "albums", "playlists", "artists"]):
+                return broad_res
         except Exception:
-            return res
+            pass
+
+        return res
 
     async def get_track(self, track_id):
         """Gets metadata for a specific track."""
@@ -285,8 +351,18 @@ class TidalAPI:
         return await self._api_request("GET", f"albums/{album_id}")
 
     async def get_album_tracks(self, album_id):
-        """Gets all tracks on an album."""
-        return await self._api_request("GET", f"albums/{album_id}/tracks")
+        """Gets all tracks on an album with automatic pagination support."""
+        tracks = []
+        limit = 100
+        offset = 0
+        while True:
+            resp = await self._api_request("GET", f"albums/{album_id}/tracks", params={"limit": limit, "offset": offset})
+            items = resp.get("items", [])
+            tracks.extend(items)
+            if len(items) < limit:
+                break
+            offset += limit
+        return {"items": tracks}
 
     async def get_playlist(self, playlist_id):
         """Gets metadata for a specific playlist."""

@@ -7,11 +7,34 @@ import subprocess
 import time
 import imageio_ffmpeg
 from mutagen.flac import FLAC, Picture
+import string
 from mutagen.mp4 import MP4, MP4Cover
 
 def sanitize_filename(name):
     """Sanitizes strings to be safe for file paths across Windows/macOS/Linux."""
-    return re.sub(r'[\/:*?"<>|]', '_', name).strip()
+    if not name:
+        return "Unknown"
+    # Replace forbidden path characters
+    clean = re.sub(r'[\/:*?"<>|]', '_', str(name))
+    # Strip whitespace and trailing dots (Windows invalid directory/file names)
+    clean = clean.strip().rstrip('.').strip()
+    # Guard against Windows reserved device names
+    reserved = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", 
+                "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", 
+                "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
+    if clean.upper() in reserved:
+        clean = f"_{clean}_"
+    return clean or "Unknown"
+
+def format_safe_template(template_str, **kwargs):
+    """Safely formats a path template without raising KeyError on missing/extra placeholders."""
+    class SafeDict(dict):
+        def __missing__(self, key):
+            return f"{{{key}}}"
+    try:
+        return string.Formatter().vformat(template_str, (), SafeDict(kwargs))
+    except Exception:
+        return f"{kwargs.get('artist', 'Unknown')}/{kwargs.get('album', 'Unknown')}/{kwargs.get('track_num', '01')} - {kwargs.get('title', 'Unknown')}.{kwargs.get('ext', 'flac')}"
 
 class DownloadManager:
     """Manages queueing, downloading, and tagging of Tidal tracks."""
@@ -34,18 +57,26 @@ class DownloadManager:
 
         # 1. Fetch Track & Album Metadata
         track = await self.api.get_track(track_id)
-        album_id = track["album"]["id"]
-        album = await self.api.get_album(album_id)
+        album_id = track.get("album", {}).get("id") if track.get("album") else None
+        album = await self.api.get_album(album_id) if album_id else {}
         
-        # Track details
-        title = track["title"]
-        artist_name = track["artist"]["name"]
-        album_title = album["title"]
+        # Track details with defensive fallbacks
+        title = track.get("title", "Unknown Title")
+        if track.get("artist") and isinstance(track["artist"], dict):
+            artist_name = track["artist"].get("name", "Unknown Artist")
+        elif track.get("artists") and isinstance(track["artists"], list) and len(track["artists"]) > 0:
+            artist_name = track["artists"][0].get("name", "Unknown Artist")
+        else:
+            artist_name = "Unknown Artist"
+
+        album_title = album.get("title", "Unknown Album") if album else "Unknown Album"
         track_num = track.get("trackNumber", 1)
-        total_tracks = album.get("numberOfTracks", 1)
+        total_tracks = album.get("numberOfTracks", 1) if album else 1
         disc_num = track.get("volumeNumber", 1)
-        release_date = album.get("releaseDate", "")
-        genre = album.get("genre", "")
+        total_discs = album.get("numberOfVolumes", 1) if album else 1
+        release_date = album.get("releaseDate", "") if album else ""
+        genre = album.get("genre", "") if album else ""
+        year = release_date.split("-")[0] if release_date else ""
         
         # Format the output paths
         safe_artist = sanitize_filename(artist_name)
@@ -58,8 +89,20 @@ class DownloadManager:
             safe_parent = sanitize_filename(parent_folder)
             base_dir = os.path.join(base_dir, safe_parent)
 
-        rel_path_flac = template.format(artist=safe_artist, album=safe_album, track_num=f'{track_num:02d}', title=safe_title, ext='flac')
-        rel_path_m4a = template.format(artist=safe_artist, album=safe_album, track_num=f'{track_num:02d}', title=safe_title, ext='m4a')
+        self._current_format_args = {
+            "artist": safe_artist,
+            "album": safe_album,
+            "track_num": f"{track_num:02d}",
+            "title": safe_title,
+            "disc_num": f"{disc_num:02d}",
+            "year": year,
+            "genre": sanitize_filename(genre),
+            "total_tracks": f"{total_tracks:02d}",
+            "total_discs": f"{total_discs:02d}"
+        }
+
+        rel_path_flac = format_safe_template(template, **self._current_format_args, ext='flac')
+        rel_path_m4a = format_safe_template(template, **self._current_format_args, ext='m4a')
         rel_path_flac = rel_path_flac.replace('/', os.sep).replace('\\', os.sep)
         rel_path_m4a = rel_path_m4a.replace('/', os.sep).replace('\\', os.sep)
 
@@ -95,7 +138,7 @@ class DownloadManager:
         stream_info = await self.api.get_stream_info(track_id, quality)
         ext = stream_info['extension']
 
-        rel_path_final = template.format(artist=safe_artist, album=safe_album, track_num=f'{track_num:02d}', title=safe_title, ext=ext)
+        rel_path_final = format_safe_template(template, **self._current_format_args, ext=ext)
         rel_path_final = rel_path_final.replace('/', os.sep).replace('\\', os.sep)
         final_path = os.path.join(base_dir, rel_path_final)
         temp_path = final_path + '.tmp'
@@ -267,10 +310,13 @@ class DownloadManager:
             if (task_state and task_state.get("is_cancelled", False)) or self.is_cancelled:
                 raise Exception("Cancelled by user before tagging")
                 
-            # Rename temp file to final destination
+            # Rename temp file to final destination atomically
             if os.path.exists(final_path):
-                os.remove(final_path)
-            os.rename(temp_path, final_path)
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+            os.replace(temp_path, final_path)
             
             # 4. Embedded Metadata Tagging
             if progress_callback:
@@ -296,8 +342,11 @@ class DownloadManager:
                 "track_num": track_num,
                 "total_tracks": total_tracks,
                 "disc_num": disc_num,
+                "total_discs": total_discs,
                 "date": release_date,
                 "genre": genre,
+                "isrc": track.get("isrc", ""),
+                "copyright": track.get("copyright", ""),
                 "cover_bytes": cover_bytes,
                 "lyrics": lyrics_text
             }
@@ -323,17 +372,19 @@ class DownloadManager:
             }
             
         except Exception as e:
-            # Clean up temp file on failure
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
+            # Clean up all temp files on failure
+            for tp in [temp_path, final_path + ".tmp", final_path + ".raw.tmp"]:
+                if os.path.exists(tp):
+                    try:
+                        os.remove(tp)
+                    except Exception:
+                        pass
             raise e
 
     def apply_metadata(self, filepath, ext, tags):
         """Applies metadata tags and cover art to the file."""
         cover_bytes = tags.get("cover_bytes")
+        total_discs = str(tags.get("total_discs", 1))
         
         if ext == "flac":
             audio = FLAC(filepath)
@@ -343,8 +394,14 @@ class DownloadManager:
             audio["tracknumber"] = str(tags["track_num"])
             audio["totaltracks"] = str(tags["total_tracks"])
             audio["discnumber"] = str(tags["disc_num"])
+            audio["totaldiscs"] = total_discs
+            audio["disctotal"] = total_discs
             audio["date"] = tags["date"]
             audio["genre"] = tags["genre"]
+            if tags.get("isrc"):
+                audio["isrc"] = tags["isrc"]
+            if tags.get("copyright"):
+                audio["copyright"] = tags["copyright"]
             
             if cover_bytes:
                 picture = Picture()
@@ -365,10 +422,12 @@ class DownloadManager:
             audio["\xa9nam"] = tags["title"]
             audio["\xa9ART"] = tags["artist"]
             audio["\xa9alb"] = tags["album"]
-            audio["trkn"] = [(tags["track_num"], tags["total_tracks"])]
-            audio["disk"] = [(tags["disc_num"], 1)]
+            audio["trkn"] = [(tags["track_num"], tags.get("total_tracks", 1))]
+            audio["disk"] = [(tags["disc_num"], int(tags.get("total_discs", 1)))]
             audio["\xa9day"] = tags["date"]
             audio["\xa9gen"] = tags["genre"]
+            if tags.get("copyright"):
+                audio["cprt"] = tags["copyright"]
             
             if cover_bytes:
                 audio["covr"] = [MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)]

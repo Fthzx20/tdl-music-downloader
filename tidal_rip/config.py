@@ -41,6 +41,7 @@ class Config:
         self.quality_tier = "HI_RES_LOSSLESS"  # Options: LOW, HIGH, LOSSLESS, HI_RES_LOSSLESS
         self.login_browser = "Default Browser"
         self.allow_dolby_atmos = False
+        self.play_sound_on_complete = True
         self.concurrent_downloads = 3
         self.file_template = "{album}/{track_num} - {title}.{ext}"
         
@@ -79,6 +80,7 @@ class Config:
             self.quality_tier = data.get("quality_tier", "HI_RES_LOSSLESS")
             self.login_browser = data.get("login_browser", "Default Browser")
             self.allow_dolby_atmos = data.get("allow_dolby_atmos", False)
+            self.play_sound_on_complete = data.get("play_sound_on_complete", True)
             self.concurrent_downloads = data.get("concurrent_downloads", 3)
             self.file_template = data.get("file_template", "{album}/{track_num} - {title}.{ext}")
         except Exception as e:
@@ -99,6 +101,7 @@ class Config:
             "quality_tier": self.quality_tier,
             "login_browser": self.login_browser,
             "allow_dolby_atmos": self.allow_dolby_atmos,
+            "play_sound_on_complete": self.play_sound_on_complete,
             "concurrent_downloads": self.concurrent_downloads,
             "file_template": self.file_template
         }

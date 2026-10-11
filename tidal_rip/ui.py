@@ -138,6 +138,42 @@ def open_browser(url, browser_name):
     else:
         webbrowser.open(url)
 
+def open_in_file_manager(path, select_file=False):
+    """Opens a directory or highlights a file in Windows Explorer / OS file manager safely."""
+    if not path:
+        return False
+    try:
+        norm_path = os.path.normpath(str(path))
+        if not os.path.exists(norm_path):
+            parent = os.path.dirname(norm_path)
+            if os.path.exists(parent):
+                norm_path = parent
+                select_file = False
+            else:
+                return False
+                
+        import platform
+        sys_name = platform.system()
+        if sys_name == "Windows":
+            if select_file and os.path.isfile(norm_path):
+                subprocess.Popen(["explorer.exe", f"/select,{norm_path}"])
+            else:
+                target_dir = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
+                subprocess.Popen(["explorer.exe", target_dir])
+        elif sys_name == "Darwin":
+            if select_file and os.path.isfile(norm_path):
+                subprocess.Popen(["open", "-R", norm_path])
+            else:
+                target_dir = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
+                subprocess.Popen(["open", target_dir])
+        else:
+            target_dir = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
+            subprocess.Popen(["xdg-open", target_dir])
+        return True
+    except Exception as e:
+        print(f"Failed to open file manager: {e}")
+        return False
+
 def parse_tidal_url(query):
     """Parses track, album, playlist, or artist/singer links from Tidal, including raw playlist UUIDs."""
     query = query.strip()
@@ -288,6 +324,276 @@ def get_quality_badge(item):
     return "", "#333333"
 
 
+class TrackSelectionModal(CTk.CTkToplevel):
+    """Modal dialog allowing users to pick which tracks to download from an album or playlist."""
+    
+    def __init__(self, parent, collection_type, collection_title, track_list, on_confirm_callback):
+        super().__init__(parent)
+        self.parent = parent
+        self.collection_type = collection_type
+        self.collection_title = collection_title
+        self.track_list = track_list
+        self.on_confirm = on_confirm_callback
+        self.check_vars = []  # list of (trk_dict, BooleanVar)
+        
+        self.title(f"Select Tracks — {collection_title}")
+        self.geometry("680x600")
+        self.minsize(540, 440)
+        self.transient(parent)
+        self.grab_set()
+        self.configure(fg_color=COLOR_DARK_BG)
+        
+        # Center over parent
+        self.update_idletasks()
+        try:
+            x = parent.winfo_x() + (parent.winfo_width() - 680) // 2
+            y = parent.winfo_y() + (parent.winfo_height() - 600) // 2
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+            
+        self._build_ui()
+
+    def _build_ui(self):
+        # Header frame
+        header = CTk.CTkFrame(self, fg_color=COLOR_FRAME_BG, corner_radius=10)
+        header.pack(fill="x", padx=20, pady=(20, 10))
+        
+        title_lbl = CTk.CTkLabel(
+            header,
+            text=self.collection_title,
+            font=CTk.CTkFont(size=16, weight="bold"),
+            text_color="white",
+            anchor="w",
+            justify="left"
+        )
+        title_lbl.pack(fill="x", padx=16, pady=(12, 2))
+        
+        sub_text = f"{self.collection_type} • {len(self.track_list)} tracks available • Choose tracks to add to queue"
+        sub_lbl = CTk.CTkLabel(
+            header,
+            text=sub_text,
+            font=CTk.CTkFont(size=12),
+            text_color=COLOR_TEXT_MUTED,
+            anchor="w",
+            justify="left"
+        )
+        sub_lbl.pack(fill="x", padx=16, pady=(0, 12))
+        
+        # Toolbar
+        toolbar = CTk.CTkFrame(self, fg_color="transparent")
+        toolbar.pack(fill="x", padx=20, pady=(5, 10))
+        
+        btn_all = CTk.CTkButton(
+            toolbar,
+            text="☑ Select All",
+            width=100,
+            height=30,
+            fg_color=COLOR_FRAME_BG,
+            hover_color="#333333",
+            border_color="#444444",
+            border_width=1,
+            font=CTk.CTkFont(size=11, weight="bold"),
+            command=self.select_all
+        )
+        btn_all.pack(side="left", padx=(0, 8))
+        
+        btn_none = CTk.CTkButton(
+            toolbar,
+            text="☐ Deselect All",
+            width=110,
+            height=30,
+            fg_color=COLOR_FRAME_BG,
+            hover_color="#333333",
+            border_color="#444444",
+            border_width=1,
+            font=CTk.CTkFont(size=11),
+            command=self.deselect_all
+        )
+        btn_none.pack(side="left", padx=(0, 8))
+
+        btn_invert = CTk.CTkButton(
+            toolbar,
+            text="🔄 Invert",
+            width=80,
+            height=30,
+            fg_color=COLOR_FRAME_BG,
+            hover_color="#333333",
+            border_color="#444444",
+            border_width=1,
+            font=CTk.CTkFont(size=11),
+            command=self.invert_selection
+        )
+        btn_invert.pack(side="left")
+        
+        self.count_lbl = CTk.CTkLabel(
+            toolbar,
+            text="",
+            font=CTk.CTkFont(size=12, weight="bold"),
+            text_color=COLOR_ACCENT
+        )
+        self.count_lbl.pack(side="right", padx=5)
+        
+        # Scrollable track listing
+        scroll_frame = CTk.CTkScrollableFrame(self, fg_color=COLOR_FRAME_BG, corner_radius=10)
+        scroll_frame.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        
+        # Check if multiple discs present
+        has_multiple_discs = any(t.get("disc_num", 1) > 1 for t in self.track_list)
+        
+        for idx, trk in enumerate(self.track_list):
+            row = CTk.CTkFrame(scroll_frame, fg_color="transparent", height=40)
+            row.pack(fill="x", pady=2, padx=4)
+            row.pack_propagate(False)
+            
+            var = CTk.BooleanVar(value=True)
+            self.check_vars.append((trk, var))
+            
+            cb = CTk.CTkCheckBox(
+                row,
+                text="",
+                variable=var,
+                width=24,
+                checkbox_width=20,
+                checkbox_height=20,
+                border_width=2,
+                fg_color=COLOR_ACCENT,
+                hover_color=COLOR_ACCENT_HOVER,
+                checkmark_color="black",
+                command=self.update_counter
+            )
+            cb.pack(side="left", padx=(8, 12))
+            
+            # Disc / Track number
+            if has_multiple_discs and trk.get("disc_num"):
+                num_text = f"{trk['disc_num']}-{trk.get('track_num', idx+1):02d}"
+            else:
+                num_text = f"{trk.get('track_num', idx+1):02d}"
+                
+            num_lbl = CTk.CTkLabel(
+                row,
+                text=num_text,
+                font=CTk.CTkFont(family="Consolas", size=11),
+                text_color=COLOR_TEXT_MUTED,
+                width=35,
+                anchor="w"
+            )
+            num_lbl.pack(side="left", padx=(0, 8))
+            
+            # Duration (packed to right FIRST so it is never displaced by long titles)
+            if trk.get("duration_str"):
+                dur_lbl = CTk.CTkLabel(
+                    row,
+                    text=trk["duration_str"],
+                    font=CTk.CTkFont(family="Consolas", size=11),
+                    text_color=COLOR_TEXT_MUTED,
+                    width=45,
+                    anchor="e"
+                )
+                dur_lbl.pack(side="right", padx=(5, 12))
+
+            # Title & artist (packed with expand=True into remaining space)
+            info_frame = CTk.CTkFrame(row, fg_color="transparent")
+            info_frame.pack(side="left", fill="both", expand=True)
+            
+            title_text = trk.get("title", "Unknown Title")
+            artist_text = trk.get("artist", "Unknown Artist")
+            
+            trk_lbl = CTk.CTkLabel(
+                info_frame,
+                text=f"{title_text}  •  {artist_text}",
+                font=CTk.CTkFont(size=12),
+                anchor="w",
+                justify="left"
+            )
+            trk_lbl.pack(side="left", fill="x", expand=True)
+                
+            # Allow clicking row text to toggle checkbox
+            def make_toggle(v=var):
+                v.set(not v.get())
+                self.update_counter()
+            trk_lbl.bind("<Button-1>", lambda e, func=make_toggle: func())
+            
+            # Subtle divider
+            if idx < len(self.track_list) - 1:
+                div = CTk.CTkFrame(scroll_frame, fg_color="#2b2b2b", height=1)
+                div.pack(fill="x", padx=10, pady=1)
+
+        # Footer action buttons
+        footer = CTk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", padx=20, pady=(0, 20))
+        
+        cancel_btn = CTk.CTkButton(
+            footer,
+            text="Cancel",
+            fg_color=COLOR_FRAME_BG,
+            hover_color="#333333",
+            text_color="white",
+            border_color="#555555",
+            border_width=1,
+            width=100,
+            height=38,
+            font=CTk.CTkFont(size=12),
+            command=self.destroy
+        )
+        cancel_btn.pack(side="right", padx=(10, 0))
+        
+        self.confirm_btn = CTk.CTkButton(
+            footer,
+            text="Download Selected",
+            fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HOVER,
+            text_color="black",
+            height=38,
+            font=CTk.CTkFont(size=13, weight="bold"),
+            command=self.confirm_selection
+        )
+        self.confirm_btn.pack(side="right")
+        
+        self.update_counter()
+
+    def select_all(self):
+        for _, var in self.check_vars:
+            var.set(True)
+        self.update_counter()
+
+    def deselect_all(self):
+        for _, var in self.check_vars:
+            var.set(False)
+        self.update_counter()
+
+    def invert_selection(self):
+        for _, var in self.check_vars:
+            var.set(not var.get())
+        self.update_counter()
+
+    def update_counter(self):
+        selected_count = sum(1 for _, var in self.check_vars if var.get())
+        total_count = len(self.check_vars)
+        self.count_lbl.configure(text=f"Selected: {selected_count} / {total_count}")
+        if selected_count == 0:
+            self.confirm_btn.configure(
+                text="Select at least 1 track",
+                state="disabled",
+                fg_color="#444444",
+                text_color="#888888"
+            )
+        else:
+            self.confirm_btn.configure(
+                text=f"Download Selected ({selected_count})",
+                state="normal",
+                fg_color=COLOR_ACCENT,
+                text_color="black"
+            )
+
+    def confirm_selection(self):
+        selected = [trk for trk, var in self.check_vars if var.get()]
+        if not selected:
+            return
+        self.destroy()
+        self.on_confirm(selected)
+
+
 class AppUI(CTk.CTk):
     """Main Application UI class running CustomTkinter."""
     
@@ -352,14 +658,16 @@ class AppUI(CTk.CTk):
         except Exception as e:
             print(f"Failed to save session: {e}")
         
-        # Clean up preview temp files (B7)
+        # Clean up preview temp files
         import glob
-        for pattern in ("preview_*.m4a", "preview_*.wav"):
-            try:
-                for fpath in glob.glob(os.path.join(self.config.download_directory, pattern)):
-                    os.remove(fpath)
-            except Exception:
-                pass
+        preview_dir = os.path.join(self.config.config_dir, "previews")
+        for target_dir in (self.config.download_directory, preview_dir):
+            for pattern in ("preview_*.m4a", "preview_*.wav"):
+                try:
+                    for fpath in glob.glob(os.path.join(target_dir, pattern)):
+                        os.remove(fpath)
+                except Exception:
+                    pass
 
     def on_closing(self):
         """Handle application close event."""
@@ -687,9 +995,31 @@ class AppUI(CTk.CTk):
         search_ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 15))
         search_ctrl.grid_columnconfigure(0, weight=1)
         
-        self.search_entry = CTk.CTkEntry(search_ctrl, placeholder_text="Search terms, Tidal / Spotify / Apple Music / YouTube URL...", height=40, font=CTk.CTkFont(size=14))
-        self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        entry_box = CTk.CTkFrame(search_ctrl, fg_color="transparent")
+        entry_box.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        entry_box.grid_columnconfigure(0, weight=1)
+
+        self.search_entry = CTk.CTkEntry(
+            entry_box, 
+            placeholder_text="Search terms, Tidal / Spotify / Apple Music / YouTube / Amazon / Qobuz URL...", 
+            height=40, 
+            font=CTk.CTkFont(size=14)
+        )
+        self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.search_entry.bind("<Return>", lambda e: self.trigger_search())
+        
+        self.clear_search_btn = CTk.CTkButton(
+            entry_box,
+            text="✕",
+            width=36,
+            height=40,
+            fg_color="#2b2b2b",
+            hover_color="#444444",
+            text_color="#aaaaaa",
+            font=CTk.CTkFont(size=13, weight="bold"),
+            command=self.clear_search_entry
+        )
+        self.clear_search_btn.grid(row=0, column=1, sticky="e")
         
         self.search_type_menu = CTk.CTkOptionMenu(
             search_ctrl,
@@ -703,12 +1033,27 @@ class AppUI(CTk.CTk):
         )
         self.search_type_menu.grid(row=0, column=1, sticky="w", padx=(0, 10))
         
-        search_btn = CTk.CTkButton(search_ctrl, text="Search", fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="black", width=100, height=40, font=CTk.CTkFont(size=13, weight="bold"), command=self.trigger_search)
-        search_btn.grid(row=0, column=2, sticky="e")
+        self.search_btn = CTk.CTkButton(
+            search_ctrl, 
+            text="Search", 
+            fg_color=COLOR_ACCENT, 
+            hover_color=COLOR_ACCENT_HOVER, 
+            text_color="black", 
+            width=100, 
+            height=40, 
+            font=CTk.CTkFont(size=13, weight="bold"), 
+            command=self.trigger_search
+        )
+        self.search_btn.grid(row=0, column=2, sticky="e")
         
         # Results frame
         self.results_scroll = CTk.CTkScrollableFrame(self.search_view, fg_color=COLOR_FRAME_BG)
         self.results_scroll.grid(row=1, column=0, sticky="nsew")
+
+    def clear_search_entry(self):
+        """Clears the search input bar."""
+        self.search_entry.delete(0, "end")
+        self.search_entry.focus_set()
 
     def show_search_status(self, text):
         for child in self.results_scroll.winfo_children():
@@ -724,17 +1069,40 @@ class AppUI(CTk.CTk):
         if not self.config.access_token:
             messagebox.showwarning("Login Required", "You must be logged in to search Tidal catalog.")
             return
+
+        self._search_gen = getattr(self, "_search_gen", 0) + 1
+        my_gen = self._search_gen
+
+        if hasattr(self, "search_btn") and self.search_btn.winfo_exists():
+            self.search_btn.configure(state="disabled", text="Searching...")
             
         self.show_search_status("Searching Tidal catalog...")
         
         search_type = self.search_type_menu.get().lower()
-        self.run_async(self.perform_search(query, search_type))
+        self.run_async(self.perform_search(query, search_type, gen=my_gen))
+
+    def finish_search(self, data, search_type, error_msg=None, gen=None):
+        """Thread-safe UI callback for search completion with race-condition guard."""
+        if hasattr(self, "search_btn") and self.search_btn.winfo_exists():
+            self.search_btn.configure(state="normal", text="Search")
+        if gen is not None and getattr(self, "_search_gen", 0) != gen:
+            return  # Older search superseded by a newer query
+        if error_msg:
+            messagebox.showerror("Search Error", error_msg)
+        elif data is not None:
+            self.populate_results(data, search_type)
 
     def trigger_artist_albums_search(self, artist_id, artist_name=""):
         """Directly retrieves and displays all catalog albums for an artist."""
         self.search_entry.delete(0, "end")
         self.search_entry.insert(0, f"https://tidal.com/artist/{artist_id}")
         self.search_type_menu.set("Albums")
+
+        self._search_gen = getattr(self, "_search_gen", 0) + 1
+        my_gen = self._search_gen
+
+        if hasattr(self, "search_btn") and self.search_btn.winfo_exists():
+            self.search_btn.configure(state="disabled", text="Searching...")
         
         lbl_text = f"Fetching albums for {artist_name}..." if artist_name else "Fetching artist albums..."
         self.show_search_status(lbl_text)
@@ -742,19 +1110,19 @@ class AppUI(CTk.CTk):
         async def fetch_albums():
             try:
                 albums_resp = await self.api.get_artist_albums(artist_id)
-                self.after(0, self.populate_results, albums_resp, "albums")
+                self.after(0, self.finish_search, albums_resp, "albums", None, my_gen)
             except Exception as e:
                 err_msg = str(e)
-                self.after(0, lambda: messagebox.showerror("Artist Albums Error", f"Failed to retrieve albums: {err_msg}"))
+                self.after(0, self.finish_search, None, "albums", f"Failed to retrieve albums: {err_msg}", my_gen)
                 
         self.run_async(fetch_albums())
 
-    async def perform_search(self, query, search_type):
+    async def perform_search(self, query, search_type, gen=None):
         query = query.strip()
         
-        # 1. External music links (Spotify, Apple Music, YouTube Music, Deezer, SoundCloud)
+        # 1. External music links (Spotify, Apple Music, YouTube Music, Deezer, SoundCloud, Amazon, Qobuz, Bandcamp)
         if is_external_music_link(query):
-            self.after(0, lambda: self.show_search_status("Resolving external link (Spotify / Apple Music / YouTube)..."))
+            self.after(0, lambda: self.show_search_status("Resolving external streaming link..."))
             resolved_query, resolved_type, display_info, service_name = await resolve_external_link(query)
             if resolved_query:
                 if resolved_type:
@@ -765,12 +1133,13 @@ class AppUI(CTk.CTk):
                 
                 try:
                     results = await self.api.smart_search(resolved_query, search_type=search_type, limit=50)
-                    self.after(0, self.populate_results, results, search_type)
+                    self.after(0, self.finish_search, results, search_type, None, gen)
                 except Exception as e:
                     err_msg = str(e)
-                    self.after(0, lambda: messagebox.showerror("Search Error", f"Search request failed: {err_msg}"))
+                    self.after(0, self.finish_search, None, search_type, f"Search request failed: {err_msg}", gen)
                 return
             else:
+                self.after(0, lambda: self.finish_search(None, search_type, None, gen))
                 self.after(0, lambda: messagebox.showwarning("Link Unresolved", "Could not extract song/album metadata from this link. Please check the URL."))
                 return
 
@@ -781,30 +1150,30 @@ class AppUI(CTk.CTk):
                 if url_type == "track":
                     track = await self.api.get_track(url_id)
                     results = {"tracks": {"items": [track]}}
-                    self.after(0, self.populate_results, results, "tracks")
+                    self.after(0, self.finish_search, results, "tracks", None, gen)
                 elif url_type == "album":
                     album = await self.api.get_album(url_id)
                     results = {"albums": {"items": [album]}}
-                    self.after(0, self.populate_results, results, "albums")
+                    self.after(0, self.finish_search, results, "albums", None, gen)
                 elif url_type == "playlist":
                     playlist = await self.api.get_playlist(url_id)
                     results = {"playlists": {"items": [playlist]}}
-                    self.after(0, self.populate_results, results, "playlists")
+                    self.after(0, self.finish_search, results, "playlists", None, gen)
                 elif url_type == "artist":
                     albums_resp = await self.api.get_artist_albums(url_id)
-                    self.after(0, self.populate_results, albums_resp, "albums")
+                    self.after(0, self.finish_search, albums_resp, "albums", None, gen)
             except Exception as e:
                 err_msg = str(e)
-                self.after(0, lambda: messagebox.showerror("Link Search Error", f"Failed to retrieve link metadata: {err_msg}"))
+                self.after(0, self.finish_search, None, search_type, f"Failed to retrieve link metadata: {err_msg}", gen)
             return
 
         # 3. High-quality smart string search
         try:
             results = await self.api.smart_search(query, search_type=search_type, limit=50)
-            self.after(0, self.populate_results, results, search_type)
+            self.after(0, self.finish_search, results, search_type, None, gen)
         except Exception as e:
             err_msg = str(e)
-            self.after(0, lambda: messagebox.showerror("Search Error", f"Search request failed: {err_msg}"))
+            self.after(0, self.finish_search, None, search_type, f"Search request failed: {err_msg}", gen)
 
     def populate_results(self, data, search_type):
         # Clear loading label
@@ -897,16 +1266,6 @@ class AppUI(CTk.CTk):
             else:
                 img_lbl.configure(text="No Image")
                 
-            text_frame = CTk.CTkFrame(row, fg_color="transparent")
-            text_frame.pack(side="left", fill="both", expand=True)
-            
-            info_lbl = CTk.CTkLabel(text_frame, text=display_text, font=CTk.CTkFont(size=12), anchor="w", justify="left")
-            info_lbl.pack(anchor="w", pady=(5, 5))
-            
-            if quality_badge_text:
-                badge = CTk.CTkLabel(text_frame, text=quality_badge_text, font=CTk.CTkFont(size=10, weight="bold"), text_color="black", fg_color=quality_badge_color, corner_radius=4, padx=5, height=20)
-                badge.pack(anchor="w")
-            
             if search_type == 'tracks':
                 def toggle_preview(tid=item_id, pbtn=None):
                     # Stop current playback
@@ -944,10 +1303,11 @@ class AppUI(CTk.CTk):
                     
                     def play_stream():
                         try:
-                            # Use track-specific temp files to avoid overwrite conflicts
-                            tmp_m4a = os.path.join(self.config.download_directory, f"preview_{tid}.m4a")
-                            tmp_wav = os.path.join(self.config.download_directory, f"preview_{tid}.wav")
-                            os.makedirs(self.config.download_directory, exist_ok=True)
+                            # Use track-specific temp files in dedicated preview cache
+                            preview_dir = os.path.join(self.config.config_dir, "previews")
+                            os.makedirs(preview_dir, exist_ok=True)
+                            tmp_m4a = os.path.join(preview_dir, f"preview_{tid}.m4a")
+                            tmp_wav = os.path.join(preview_dir, f"preview_{tid}.wav")
                             
                             # Check if we already have cached WAV for this track
                             if not (os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000):
@@ -1009,8 +1369,13 @@ class AppUI(CTk.CTk):
                             self.after(0, lambda: safe_pbtn('▶'))
                             
                     threading.Thread(target=play_stream, daemon=True).start()
+
+            # Pack action buttons to the right FIRST so they are anchored and never displaced
+            btn_box = CTk.CTkFrame(row, fg_color="transparent")
+            btn_box.pack(side="right", padx=(5, 10), pady=20)
+
             dl_btn = CTk.CTkButton(
-                row, 
+                btn_box, 
                 text=btn_text, 
                 fg_color=COLOR_ACCENT, 
                 hover_color=COLOR_ACCENT_HOVER, 
@@ -1019,11 +1384,25 @@ class AppUI(CTk.CTk):
                 font=CTk.CTkFont(size=11, weight="bold"),
                 command=action_func
             )
-            dl_btn.pack(side="right", padx=10, pady=25)
+            dl_btn.pack(side="right", padx=(5, 0))
+
             if search_type == 'tracks':
-                pbtn = CTk.CTkButton(row, text='▶', width=30, fg_color='#444', hover_color='#666')
+                pbtn = CTk.CTkButton(btn_box, text='▶', width=30, fg_color='#444', hover_color='#666')
                 pbtn.configure(command=lambda p=pbtn, t=item_id: toggle_preview(tid=t, pbtn=p))
-                pbtn.pack(side="right", padx=5, pady=25)
+                pbtn.pack(side="right", padx=(0, 5))
+
+            # Pack text frame LAST with expand=True so it claims all remaining middle space
+            text_frame = CTk.CTkFrame(row, fg_color="transparent")
+            text_frame.pack(side="left", fill="both", expand=True)
+            
+            info_lbl = CTk.CTkLabel(text_frame, text=display_text, font=CTk.CTkFont(size=12), anchor="w", justify="left")
+            info_lbl.pack(anchor="w", pady=(5, 5))
+            
+            if quality_badge_text:
+                badge = CTk.CTkLabel(text_frame, text=quality_badge_text, font=CTk.CTkFont(size=10, weight="bold"), text_color="black", fg_color=quality_badge_color, corner_radius=4, padx=5, height=20)
+                badge.pack(anchor="w")
+                if search_type == 'tracks':
+                    self.run_async(self.load_and_set_specs(item_id, badge))
             
             divider = CTk.CTkFrame(self.results_scroll, fg_color="#333333", height=1)
             divider.pack(fill="x", padx=5)
@@ -1051,6 +1430,9 @@ class AppUI(CTk.CTk):
         cancel_btn = CTk.CTkButton(header, text="Cancel All", width=80, fg_color="#f44336", hover_color="#d32f2f", text_color="white", command=self.cancel_all_downloads)
         cancel_btn.pack(side="right", padx=5)
         
+        open_folder_btn = CTk.CTkButton(header, text="📁 Open Folder", width=105, fg_color=COLOR_FRAME_BG, hover_color="#333333", text_color="white", border_color="#555555", border_width=1, command=lambda: open_in_file_manager(self.config.download_directory))
+        open_folder_btn.pack(side="right", padx=5)
+
         clear_btn = CTk.CTkButton(header, text="Clear Finished", width=100, fg_color=COLOR_FRAME_BG, hover_color="#333333", text_color="white", border_color=COLOR_ACCENT, border_width=1, command=self.clear_finished_downloads)
         clear_btn.pack(side="right", padx=5)
         
@@ -1062,11 +1444,36 @@ class AppUI(CTk.CTk):
         total = len(self.queue_items)
         if total == 0:
             self.queue_summary_lbl.configure(text="")
+            self._queue_was_active = False
             return
         completed = sum(1 for item in self.queue_items.values() if item["status"] == "completed")
         failed = sum(1 for item in self.queue_items.values() if item["status"] == "failed")
         pending = sum(1 for item in self.queue_items.values() if item["status"] in ["queued", "downloading"])
         self.queue_summary_lbl.configure(text=f"Total: {total} | Completed: {completed} | Failed: {failed} | Pending: {pending}")
+
+        # Completion sound alert trigger
+        if getattr(self, "_queue_was_active", False) and pending == 0 and completed > 0:
+            self._queue_was_active = False
+            self.play_completion_alert()
+        elif pending > 0:
+            self._queue_was_active = True
+
+    def play_completion_alert(self):
+        """Plays a gentle notification sound when the entire download queue finishes."""
+        if not getattr(self.config, "play_sound_on_complete", True):
+            return
+            
+        def do_sound():
+            try:
+                import platform
+                if platform.system() == "Windows":
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                else:
+                    print("\a", end="", flush=True)
+            except Exception as e:
+                print(f"Completion sound failed: {e}")
+                
+        threading.Thread(target=do_sound, daemon=True).start()
 
     def toggle_pause(self):
         if self.downloader.is_paused:
@@ -1079,15 +1486,24 @@ class AppUI(CTk.CTk):
     def cancel_all_downloads(self):
         if messagebox.askyesno("Cancel Downloads", "Are you sure you want to cancel all downloads?"):
             self.downloader.is_cancelled = True
+            self.pending_downloads.clear()
             
-            # Clear queued items
-            for tid in list(self.queue_order):
-                if self.queue_items[tid]["status"] == "queued":
-                    self.queue_items[tid]["status"] = "cancelled"
-                    self.queue_items[tid]["status_lbl"].configure(text="Cancelled", text_color="#f44336")
-                    self.queue_order.remove(tid)
-                    
-            # Reset flag after a short delay to allow current downloads to exit gracefully
+            for tid in list(self.queue_items.keys()):
+                item = self.queue_items[tid]
+                if item["status"] in ["queued", "downloading"]:
+                    item["status"] = "cancelled"
+                    if item.get("task_state"):
+                        item["task_state"]["is_cancelled"] = True
+                    def safe_cancel(i=item):
+                        try:
+                            if i["status_lbl"].winfo_exists():
+                                i["status_lbl"].configure(text="Cancelled", text_color="#f44336")
+                            if i["progress_bar"].winfo_exists():
+                                i["progress_bar"].configure(progress_color="#f44336")
+                        except Exception:
+                            pass
+                    self.after(0, safe_cancel)
+            self.update_queue_summary()
             self.after(1500, self._reset_cancel_flag)
             
     def _reset_cancel_flag(self):
@@ -1122,12 +1538,13 @@ class AppUI(CTk.CTk):
         progress_frame = CTk.CTkFrame(row, fg_color="transparent")
         progress_frame.pack(side="bottom", fill="x", padx=15, pady=(0, 10))
         
+        # Control frame (packed to right FIRST so buttons and status text are never squished)
+        ctrl_frame = CTk.CTkFrame(progress_frame, fg_color="transparent")
+        ctrl_frame.pack(side="right")
+
         progress_bar = CTk.CTkProgressBar(progress_frame, fg_color="#444444", progress_color=COLOR_ACCENT)
         progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 15))
         progress_bar.set(0.0)
-        
-        ctrl_frame = CTk.CTkFrame(progress_frame, fg_color="transparent")
-        ctrl_frame.pack(side="right")
         
         lbl_frame = CTk.CTkFrame(ctrl_frame, width=280, height=20, fg_color="transparent")
         lbl_frame.pack(side="left", padx=(0, 10))
@@ -1201,13 +1618,28 @@ class AppUI(CTk.CTk):
                 
         retry_btn = CTk.CTkButton(ctrl_frame, text="🔁", width=25, height=20, fg_color="#2196f3", hover_color="#1976d2", text_color="white", command=retry_item)
         
+        open_btn = CTk.CTkButton(
+            ctrl_frame,
+            text="📁",
+            width=26,
+            height=20,
+            fg_color=COLOR_FRAME_BG,
+            hover_color="#333333",
+            text_color="white",
+            border_color="#555555",
+            border_width=1
+        )
+
         self.queue_items[track_id] = {
             "row": row,
             "progress_bar": progress_bar,
             "status_lbl": status_lbl,
             "pause_btn": pause_btn,
             "cancel_btn": cancel_btn,
+            "top_btn": top_btn,
             "retry_btn": retry_btn,
+            "open_btn": open_btn,
+            "final_path": None,
             "title": title,
             "status": "queued",
             "parent_folder": parent_folder,
@@ -1215,6 +1647,7 @@ class AppUI(CTk.CTk):
         }
         self.queue_order.append(track_id)
         self.pending_downloads.append(track_id)
+        self._queue_was_active = True
         self.update_queue_summary()
             
         # Switch to Queue tab to see progress
@@ -1230,15 +1663,34 @@ class AppUI(CTk.CTk):
             if not items:
                 raise Exception("No tracks found on this album.")
                 
-            self.after(0, lambda: messagebox.showinfo("Album Queued", f"Adding {len(items)} tracks from '{album_title}' to the download queue."))
-            
+            formatted_tracks = []
             for item in items:
                 track_id = item["id"]
-                title = f"{item['title']} - {item['artist']['name']}"
-                self.after(0, self.queue_track_download, track_id, title)
+                artists = item.get("artists", [])
+                artist_name = artists[0]["name"] if artists else (item.get("artist") or {}).get("name", "Unknown Artist")
+                dur = item.get("duration", 0)
+                dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else ""
+                formatted_tracks.append({
+                    "id": track_id,
+                    "title": item.get("title", "Unknown Title"),
+                    "artist": artist_name,
+                    "track_num": item.get("trackNumber", len(formatted_tracks) + 1),
+                    "disc_num": item.get("volumeNumber", 1),
+                    "duration_str": dur_str,
+                })
+                
+            def open_dialog():
+                TrackSelectionModal(
+                    parent=self,
+                    collection_type="Album",
+                    collection_title=album_title,
+                    track_list=formatted_tracks,
+                    on_confirm_callback=lambda sel: self.on_tracks_selected_for_download(sel, album_title, is_playlist=False)
+                )
+            self.after(0, open_dialog)
         except Exception as e:
             err_msg = str(e)
-            self.after(0, lambda: messagebox.showerror("Album Error", f"Failed to download album tracks: {err_msg}"))
+            self.after(0, lambda: messagebox.showerror("Album Error", f"Failed to retrieve album tracks: {err_msg}"))
 
     def queue_playlist_downloads(self, playlist_id, playlist_title):
         self.run_async(self.fetch_and_queue_playlist(playlist_id, playlist_title))
@@ -1249,21 +1701,50 @@ class AppUI(CTk.CTk):
             if not items:
                 raise Exception("No tracks found in this playlist.")
                 
-            self.after(0, lambda: messagebox.showinfo("Playlist Queued", f"Adding {len(items)} tracks from playlist '{playlist_title}' to the download queue."))
-            
-            for item in items:
-                # Playlist response might wrap tracks in a sub-field 'item' or return them flat
+            formatted_tracks = []
+            for idx, item in enumerate(items):
                 track_info = item.get("item") if "item" in item else item
-                
                 if track_info and ("id" in track_info):
                     track_id = track_info["id"]
                     artists = track_info.get("artists", [])
-                    artist_name = artists[0]["name"] if artists else track_info.get("artist", {}).get("name", "Unknown Artist")
-                    title = f"{track_info.get('title', 'Unknown Title')} - {artist_name}"
-                    self.after(0, self.queue_track_download, track_id, title, playlist_title)
+                    artist_name = artists[0]["name"] if artists else (track_info.get("artist") or {}).get("name", "Unknown Artist")
+                    dur = track_info.get("duration", 0)
+                    dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else ""
+                    formatted_tracks.append({
+                        "id": track_id,
+                        "title": track_info.get("title", "Unknown Title"),
+                        "artist": artist_name,
+                        "track_num": idx + 1,
+                        "disc_num": track_info.get("volumeNumber", 1),
+                        "duration_str": dur_str,
+                    })
+                    
+            def open_dialog():
+                TrackSelectionModal(
+                    parent=self,
+                    collection_type="Playlist",
+                    collection_title=playlist_title,
+                    track_list=formatted_tracks,
+                    on_confirm_callback=lambda sel: self.on_tracks_selected_for_download(sel, playlist_title, is_playlist=True)
+                )
+            self.after(0, open_dialog)
         except Exception as e:
             err_msg = str(e)
-            self.after(0, lambda: messagebox.showerror("Playlist Error", f"Failed to download playlist tracks: {err_msg}"))
+            self.after(0, lambda: messagebox.showerror("Playlist Error", f"Failed to retrieve playlist tracks: {err_msg}"))
+
+    def on_tracks_selected_for_download(self, selected_tracks, collection_title=None, is_playlist=False):
+        """Queues chosen tracks from the selection dialog and switches to the queue monitor view."""
+        if not selected_tracks:
+            return
+            
+        for trk in selected_tracks:
+            track_id = trk["id"]
+            artist_name = trk.get("artist", "Unknown Artist")
+            title = f"{trk.get('title', 'Unknown Title')} - {artist_name}"
+            parent_folder = collection_title if is_playlist else None
+            self.queue_track_download(track_id, title, parent_folder=parent_folder)
+            
+        self.switch_view("queue")
 
     async def download_worker(self):
         max_c = getattr(self.config, 'concurrent_downloads', 3)
@@ -1285,7 +1766,14 @@ class AppUI(CTk.CTk):
         self.queue_items[tid]["status"] = "downloading"
         
         def make_callback(tid):
+            last_ui_time = 0.0
             async def progress_update(downloaded, total, status_text):
+                nonlocal last_ui_time
+                now = time.time()
+                # Performance patch: throttle GUI redraws to at most 4x/sec unless 0% or 100%
+                if (now - last_ui_time < 0.25) and (0 < downloaded < total):
+                    return
+                last_ui_time = now
                 progress = float(downloaded) / max(1.0, float(total))
                 def safe_update():
                     try:
@@ -1307,17 +1795,38 @@ class AppUI(CTk.CTk):
             res = await self.downloader.download_track(tid, make_callback(tid), parent_folder, task_state)
             if tid in self.queue_items:
                 self.queue_items[tid]["status"] = "completed"
+                final_path = res.get("final_path") if isinstance(res, dict) else str(res)
+                self.queue_items[tid]["final_path"] = final_path
                 spec_text = res.get("spec_str", "") if isinstance(res, dict) else ""
                 completed_msg = f"Completed{spec_text}" if spec_text else "Completed"
-                def safe_complete(nid=tid, msg=completed_msg):
+                
+                def safe_complete(nid=tid, msg=completed_msg, fpath=final_path):
                     try:
                         if nid in self.queue_items:
                             pb = self.queue_items[nid].get("progress_bar")
                             sl = self.queue_items[nid].get("status_lbl")
+                            ob = self.queue_items[nid].get("open_btn")
+                            pause_b = self.queue_items[nid].get("pause_btn")
+                            cancel_b = self.queue_items[nid].get("cancel_btn")
+                            top_b = self.queue_items[nid].get("top_btn")
+                            
                             if pb and pb.winfo_exists():
                                 pb.configure(progress_color="#4caf50")
                             if sl and sl.winfo_exists():
                                 sl.configure(text=msg)
+                                
+                            # Hide pause/cancel/top buttons since download is done
+                            if pause_b and pause_b.winfo_exists():
+                                pause_b.pack_forget()
+                            if cancel_b and cancel_b.winfo_exists():
+                                cancel_b.pack_forget()
+                            if top_b and top_b.winfo_exists():
+                                top_b.pack_forget()
+                                
+                            # Show Open in Explorer button
+                            if ob and ob.winfo_exists() and fpath:
+                                ob.configure(command=lambda p=fpath: open_in_file_manager(p, select_file=True))
+                                ob.pack(side="left", padx=2)
                     except Exception:
                         pass
                 self.after(0, safe_complete)
@@ -1406,6 +1915,17 @@ class AppUI(CTk.CTk):
             self.atmos_switch.select()
         else:
             self.atmos_switch.deselect()
+
+        # Sound Alert Selection
+        sound_lbl = CTk.CTkLabel(self.settings_view, text="Queue Completion Audio Alert", font=CTk.CTkFont(size=13, weight="bold"))
+        sound_lbl.pack(anchor="w", pady=(5, 5))
+        
+        self.sound_switch = CTk.CTkSwitch(self.settings_view, text="Play audio chime when all queue downloads finish", progress_color=COLOR_ACCENT)
+        self.sound_switch.pack(anchor="w", pady=(0, 20))
+        if getattr(self.config, "play_sound_on_complete", True):
+            self.sound_switch.select()
+        else:
+            self.sound_switch.deselect()
         lbl_t = CTk.CTkLabel(self.settings_view, text='File Naming Template', font=CTk.CTkFont(size=13, weight='bold'))
         lbl_t.pack(anchor="w", pady=(5, 5))
         self.template_entry = CTk.CTkEntry(self.settings_view, width=300, height=35)
@@ -1490,6 +2010,7 @@ class AppUI(CTk.CTk):
         self.config.quality_tier = new_quality
         self.config.login_browser = new_browser
         self.config.allow_dolby_atmos = new_atmos
+        self.config.play_sound_on_complete = bool(self.sound_switch.get())
         self.config.concurrent_downloads = new_concurrent
         self.config.file_template = new_template
         
