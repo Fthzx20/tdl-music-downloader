@@ -65,6 +65,9 @@ class TidalAPI:
                     await self.refresh_token()
                     headers["Authorization"] = f"Bearer {self.config.access_token}"
                     async with session.request(method, url, headers=headers, params=request_params, json=json_data) as retry_resp:
+                        if retry_resp.status == 404:
+                            err_text = await retry_resp.text()
+                            raise Exception(f"Tidal API error (404): Resource not found or delisted: {err_text[:100]}")
                         if retry_resp.status >= 400:
                             err_text = await retry_resp.text()
                             raise Exception(f"API request failed with status {retry_resp.status}: {err_text}")
@@ -79,12 +82,16 @@ class TidalAPI:
                             raise Exception(f"Rate limited by Tidal (429): {err_text}")
                         return await retry_resp.json()
                 
+                if resp.status == 404:
+                    err_text = await resp.text()
+                    raise Exception(f"Tidal API error (404): Resource not found or delisted: {err_text[:100]}")
+
                 if resp.status >= 400:
                     err_text = await resp.text()
                     raise Exception(f"API request failed with status {resp.status}: {err_text}")
                 
                 return await resp.json()
-        except Exception as e:
+        except aiohttp.ClientError as e:
             raise Exception(f"Network error requesting {url}: {e}")
 
     # --- PKCE Authorization Code Flow (primary login method) ---
@@ -216,19 +223,133 @@ class TidalAPI:
 
     # --- Search & Metadata Methods ---
 
+    def rank_search_items(self, items, query, search_type="tracks"):
+        """
+        Ranks catalog search items with intelligent audiophile relevance scoring:
+        1. Exact phrase/token matching against title, artist, and album.
+        2. Demotion of tribute bands, karaoke, and unrelated covers unless explicitly searched.
+        3. Audiophile bonus: Prioritizes 24-bit 192kHz Studio Master and 96kHz Hi-Res over standard CD/lossy.
+        """
+        clean_q = query.strip().lower()
+        q_tokens = [t for t in re.split(r"\W+", clean_q) if len(t) > 1]
+
+        def score_item(item):
+            if not isinstance(item, dict):
+                return 0.0
+            score = 0.0
+
+            title = str(item.get("title") or item.get("name") or "").lower()
+            artist = ""
+            if item.get("artist") and isinstance(item["artist"], dict):
+                artist = str(item["artist"].get("name", "")).lower()
+            elif item.get("artists") and isinstance(item["artists"], list) and len(item["artists"]) > 0:
+                artist = str(item["artists"][0].get("name", "")).lower()
+
+            combined = f"{artist} {title}".strip()
+
+            # 1. Exact & Substring Matches
+            if clean_q == title or clean_q == combined:
+                score += 160.0
+            elif clean_q in combined:
+                score += 85.0
+            elif title in clean_q or (artist and artist in clean_q):
+                score += 60.0
+
+            # 2. Token overlap
+            if q_tokens:
+                matched = sum(1 for tok in q_tokens if tok in combined)
+                score += (matched / len(q_tokens)) * 45.0
+
+            # 3. Demote unwanted noise (karaoke, tribute, etc.) unless requested
+            unwanted = ["karaoke", "tribute", "originally performed", "in the style of", "backing track", "cover version"]
+            for u in unwanted:
+                if u in combined and u not in clean_q:
+                    score -= 70.0
+
+            # 4. Audiophile Hi-Res Quality Boost
+            aq = str(item.get("audioQuality", "")).upper()
+            bd = int(item.get("bitDepth") or 16)
+            sr = float(item.get("sampleRate") or 44100) / 1000.0
+
+            if aq == "HI_RES_LOSSLESS" or bd >= 24:
+                if sr >= 176.4:
+                    score += 25.0  # 192kHz Master
+                elif sr >= 88.2:
+                    score += 18.0  # 96kHz Hi-Res
+                else:
+                    score += 10.0  # 24-bit 44.1/48kHz
+            elif aq == "LOSSLESS":
+                score += 5.0
+
+            if item.get("explicit"):
+                score += 1.0
+
+            if item.get("_isrc_match"):
+                score += 500.0
+
+            return score
+
+        return sorted(items, key=score_item, reverse=True)
+
     async def search(self, query, limit=30, offset=0, types=None):
-        """Searches Tidal catalog for tracks, albums, playlists, and artists."""
+        """Searches Tidal catalog for tracks, albums, playlists, and artists with ISRC and Barcode support."""
+        clean_q = str(query).strip()
+        limit_clean = max(1, min(int(limit), 100))
+        offset_clean = max(0, int(offset))
+
+        # Direct ISRC code matching (12 characters, e.g. USUM71703861)
+        if re.match(r"^[A-Z]{2}[A-Z0-9]{3}\d{7}$", clean_q, re.I):
+            try:
+                raw_res = await self._api_request("GET", "search", params={
+                    "query": clean_q,
+                    "limit": limit_clean,
+                    "offset": offset_clean,
+                    "types": "TRACKS"
+                })
+                if isinstance(raw_res, dict) and "tracks" in raw_res and len(raw_res["tracks"].get("items", [])) > 0:
+                    matched_items = []
+                    for itm in raw_res["tracks"]["items"]:
+                        if str(itm.get("isrc", "")).upper() == clean_q.upper():
+                            itm["_isrc_match"] = True
+                            matched_items.insert(0, itm)
+                        else:
+                            matched_items.append(itm)
+                    raw_res["tracks"]["items"] = matched_items
+                    return raw_res
+            except Exception:
+                pass
+
+        # Direct Barcode / UPC / EAN matching (12-14 digits)
+        if re.match(r"^\d{12,14}$", clean_q):
+            try:
+                alb_res = await self._api_request("GET", "search", params={
+                    "query": clean_q,
+                    "limit": limit_clean,
+                    "offset": offset_clean,
+                    "types": "ALBUMS"
+                })
+                if isinstance(alb_res, dict) and "albums" in alb_res and len(alb_res["albums"].get("items", [])) > 0:
+                    return alb_res
+            except Exception:
+                pass
+            try:
+                alb = await self.get_album(clean_q)
+                if alb and isinstance(alb, dict) and alb.get("id"):
+                    return {"albums": {"items": [alb], "totalNumberOfItems": 1}}
+            except Exception:
+                pass
+
         if not types:
             types = "TRACKS,ALBUMS,PLAYLISTS,ARTISTS"
         params = {
-            "query": query,
-            "limit": limit,
-            "offset": offset,
+            "query": clean_q,
+            "limit": limit_clean,
+            "offset": offset_clean,
             "types": types
         }
         return await self._api_request("GET", "search", params=params)
 
-    async def smart_search(self, query, search_type="tracks", limit=30):
+    async def smart_search(self, query, search_type="tracks", limit=30, offset=0):
         """Intelligent search that optimizes category filtering, handles diacritics/accents, permutation fallbacks, and cross-category recovery."""
         type_map = {
             "tracks": "TRACKS",
@@ -239,12 +360,25 @@ class TidalAPI:
         clean_st = search_type.lower()
         target_type = type_map.get(clean_st, "TRACKS,ALBUMS,PLAYLISTS,ARTISTS")
         clean_q = query.strip()
+        limit_clean = max(1, min(int(limit), 100))
+        offset_clean = max(0, int(offset))
+
+        def _post_process(result_dict):
+            if not isinstance(result_dict, dict):
+                return result_dict
+            if "tracks" in result_dict and isinstance(result_dict["tracks"], dict):
+                items = result_dict["tracks"].get("items", [])
+                result_dict["tracks"]["items"] = self.rank_search_items(items, clean_q, "tracks")
+            if "albums" in result_dict and isinstance(result_dict["albums"], dict):
+                items = result_dict["albums"].get("items", [])
+                result_dict["albums"]["items"] = self.rank_search_items(items, clean_q, "albums")
+            return result_dict
         
         # 1. Primary search with direct user query
         try:
-            res = await self.search(clean_q, limit=limit, types=target_type)
+            res = await self.search(clean_q, limit=limit_clean, offset=offset_clean, types=target_type)
             if clean_st in res and len(res[clean_st].get("items", [])) > 0:
-                return res
+                return _post_process(res)
         except Exception:
             res = {}
 
@@ -301,18 +435,18 @@ class TidalAPI:
                 continue
             seen_cand.add(cand.lower())
             try:
-                cand_res = await self.search(cand, limit=limit, types=target_type)
+                cand_res = await self.search(cand, limit=limit_clean, offset=offset_clean, types=target_type)
                 if clean_st in cand_res and len(cand_res[clean_st].get("items", [])) > 0:
-                    return cand_res
+                    return _post_process(cand_res)
             except Exception:
                 pass
 
         # 3. Broad multi-category fallback
         try:
             broad_query = cleaned or unaccented or clean_q
-            broad_res = await self.search(broad_query, limit=limit, types="TRACKS,ALBUMS,PLAYLISTS,ARTISTS")
+            broad_res = await self.search(broad_query, limit=limit_clean, offset=offset_clean, types="TRACKS,ALBUMS,PLAYLISTS,ARTISTS")
             if clean_st in broad_res and len(broad_res[clean_st].get("items", [])) > 0:
-                return broad_res
+                return _post_process(broad_res)
 
             # 4. Cross-category recovery:
             # If user wanted albums but 0 albums found, extract albums from matching tracks
@@ -325,15 +459,15 @@ class TidalAPI:
                         seen_album_ids.add(alb["id"])
                         recovered_albums.append(alb)
                 if recovered_albums:
-                    return {"albums": {"items": recovered_albums, "totalNumberOfItems": len(recovered_albums)}}
+                    return {"albums": {"items": self.rank_search_items(recovered_albums, clean_q, "albums"), "totalNumberOfItems": len(recovered_albums)}}
 
             # If user wanted tracks and 0 found, but any other category matched, return broad
             if any(len(broad_res.get(k, {}).get("items", [])) > 0 for k in ["tracks", "albums", "playlists", "artists"]):
-                return broad_res
+                return _post_process(broad_res)
         except Exception:
             pass
 
-        return res
+        return _post_process(res)
 
     async def get_track(self, track_id):
         """Gets metadata for a specific track."""

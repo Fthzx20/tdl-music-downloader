@@ -594,6 +594,96 @@ class TrackSelectionModal(CTk.CTkToplevel):
         self.on_confirm(selected)
 
 
+class BatchImportModal(CTk.CTkToplevel):
+    """Modal dialog for batch importing and downloading multiple URLs / track IDs."""
+
+    def __init__(self, parent, on_process_batch):
+        super().__init__(parent)
+        self.title("Batch URL / ID Importer")
+        self.geometry("640x520")
+        self.minsize(520, 380)
+        self.configure(fg_color=COLOR_DARK_BG)
+        self.on_process_batch = on_process_batch
+
+        self.transient(parent)
+        self.grab_set()
+
+        # Header
+        header = CTk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=20, pady=(20, 10))
+
+        CTk.CTkLabel(
+            header,
+            text="📋 Batch Import (Paste Multiple URLs / IDs)",
+            font=CTk.CTkFont(size=16, weight="bold"),
+            text_color=COLOR_ACCENT
+        ).pack(anchor="w")
+
+        guide_txt = "Paste multiple links or IDs below (one per line).\nSupports Tidal, Spotify, Apple Music, YouTube Music, Deezer, SoundCloud, Bandcamp, Amazon Music, and Qobuz."
+        CTk.CTkLabel(header, text=guide_txt, font=CTk.CTkFont(size=11), text_color=COLOR_TEXT_MUTED, justify="left").pack(anchor="w", pady=(4, 0))
+
+        # Text Area
+        self.textbox = CTk.CTkTextbox(self, fg_color=COLOR_FRAME_BG, font=CTk.CTkFont(family="Consolas", size=12))
+        self.textbox.pack(fill="both", expand=True, padx=20, pady=(5, 10))
+        self.textbox.focus_set()
+
+        # Toolbar
+        toolbar = CTk.CTkFrame(self, fg_color="transparent")
+        toolbar.pack(fill="x", padx=20, pady=(0, 15))
+
+        paste_btn = CTk.CTkButton(toolbar, text="📋 Paste Clipboard", width=120, height=32, fg_color=COLOR_FRAME_BG, hover_color="#2b374a", command=self.paste_clipboard)
+        paste_btn.pack(side="left", padx=(0, 6))
+
+        file_btn = CTk.CTkButton(toolbar, text="📁 Load .txt File", width=110, height=32, fg_color=COLOR_FRAME_BG, hover_color="#2b374a", command=self.load_from_file)
+        file_btn.pack(side="left", padx=(0, 6))
+
+        clear_btn = CTk.CTkButton(toolbar, text="Clear", width=70, height=32, fg_color=COLOR_FRAME_BG, hover_color="#2b374a", command=lambda: self.textbox.delete("1.0", "end"))
+        clear_btn.pack(side="left")
+
+        cancel_btn = CTk.CTkButton(toolbar, text="Cancel", width=80, height=32, fg_color=COLOR_FRAME_BG, hover_color="#2b374a", command=self.destroy)
+        cancel_btn.pack(side="right", padx=(8, 0))
+
+        self.submit_btn = CTk.CTkButton(
+            toolbar,
+            text="🚀 Queue All Links",
+            height=32,
+            fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HOVER,
+            text_color="black",
+            font=CTk.CTkFont(weight="bold"),
+            command=self.submit
+        )
+        self.submit_btn.pack(side="right")
+
+    def paste_clipboard(self):
+        try:
+            txt = self.clipboard_get()
+            if txt:
+                self.textbox.insert("end", txt + "\n")
+        except Exception:
+            pass
+
+    def load_from_file(self):
+        fpath = filedialog.askopenfilename(filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
+        if fpath:
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    self.textbox.insert("end", content + "\n")
+            except Exception as e:
+                messagebox.showerror("File Error", f"Could not read file: {e}")
+
+    def submit(self):
+        raw = self.textbox.get("1.0", "end").strip()
+        lines = [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
+        if not lines:
+            messagebox.showwarning("Empty List", "Please paste at least one URL or ID.")
+            return
+
+        self.destroy()
+        self.on_process_batch(lines)
+
+
 class AppUI(CTk.CTk):
     """Main Application UI class running CustomTkinter."""
     
@@ -605,8 +695,8 @@ class AppUI(CTk.CTk):
         self.downloader = DownloadManager(self.api, self.config)
         
         self.title("Tidal Rip - HiFi Downloader")
-        self.geometry("950x600")
-        self.minsize(800, 500)
+        self.geometry("980x620")
+        self.minsize(820, 520)
         self.configure(fg_color=COLOR_DARK_BG)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -616,6 +706,23 @@ class AppUI(CTk.CTk):
         self.queue_order = []
         self.pending_downloads = []
         
+        # Search & catalog state
+        self.recent_searches = list(self.config.recent_searches) if hasattr(self.config, "recent_searches") else []
+        self._raw_search_items = []
+        self._current_search_query = ""
+        self._current_search_type = "tracks"
+        self._current_search_offset = 0
+        self._current_search_total = 0
+        self._is_loading_more = False
+        self._render_batch_id = 0
+        self._search_gen = 0
+        self._background_futures = set()
+
+        # Global Keybindings
+        self.bind("<Control-f>", lambda e: self.focus_search())
+        self.bind("<Control-F>", lambda e: self.focus_search())
+        self.bind("<Escape>", lambda e: self.clear_search_entry())
+
         # Image management (B2: prevent garbage collection, O2: caching)
         self._image_refs = []
         self._image_cache = {}
@@ -696,9 +803,18 @@ class AppUI(CTk.CTk):
         except Exception as e:
             print(f"Failed to load session: {e}")
 
+    def focus_search(self):
+        self.switch_view("search")
+        if hasattr(self, "search_entry") and self.search_entry.winfo_exists():
+            self.search_entry.focus_set()
+            self.search_entry.select_range(0, "end")
+
     def run_async(self, coro):
         """Helper to run a coroutine safely in the background event loop."""
-        return asyncio.run_coroutine_threadsafe(coro, self.async_loop)
+        fut = asyncio.run_coroutine_threadsafe(coro, self.async_loop)
+        self._background_futures.add(fut)
+        fut.add_done_callback(lambda f: self._background_futures.discard(f))
+        return fut
 
     async def load_and_set_image(self, url, image_label):
         """Loads a thumbnail image from URL, with caching, GC protection, and safe widget checks."""
@@ -987,23 +1103,23 @@ class AppUI(CTk.CTk):
 
     def create_search_view(self):
         self.search_view = CTk.CTkFrame(self.main_container, fg_color="transparent")
-        self.search_view.grid_rowconfigure(1, weight=1)
+        self.search_view.grid_rowconfigure(3, weight=1)
         self.search_view.grid_columnconfigure(0, weight=1)
         
-        # Search controls
+        # 1. Search controls bar
         search_ctrl = CTk.CTkFrame(self.search_view, fg_color="transparent")
-        search_ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 15))
+        search_ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         search_ctrl.grid_columnconfigure(0, weight=1)
         
         entry_box = CTk.CTkFrame(search_ctrl, fg_color="transparent")
-        entry_box.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        entry_box.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         entry_box.grid_columnconfigure(0, weight=1)
 
         self.search_entry = CTk.CTkEntry(
             entry_box, 
-            placeholder_text="Search terms, Tidal / Spotify / Apple Music / YouTube / Amazon / Qobuz URL...", 
+            placeholder_text="Search terms, ISRC, Barcode, or paste Tidal / Spotify / Apple / YT link...", 
             height=40, 
-            font=CTk.CTkFont(size=14)
+            font=CTk.CTkFont(size=13)
         )
         self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.search_entry.bind("<Return>", lambda e: self.trigger_search())
@@ -1023,15 +1139,16 @@ class AppUI(CTk.CTk):
         
         self.search_type_menu = CTk.CTkOptionMenu(
             search_ctrl,
-            values=["Tracks", "Albums", "Playlists", "Artists"],
-            width=110,
+            values=["All", "Tracks", "Albums", "Playlists", "Artists"],
+            width=105,
             height=40,
             fg_color=COLOR_FRAME_BG,
             button_color=COLOR_FRAME_BG,
             button_hover_color="#333333",
             dropdown_fg_color=COLOR_FRAME_BG
         )
-        self.search_type_menu.grid(row=0, column=1, sticky="w", padx=(0, 10))
+        self.search_type_menu.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.search_type_menu.set("All")
         
         self.search_btn = CTk.CTkButton(
             search_ctrl, 
@@ -1039,23 +1156,135 @@ class AppUI(CTk.CTk):
             fg_color=COLOR_ACCENT, 
             hover_color=COLOR_ACCENT_HOVER, 
             text_color="black", 
-            width=100, 
+            width=95, 
             height=40, 
             font=CTk.CTkFont(size=13, weight="bold"), 
             command=self.trigger_search
         )
         self.search_btn.grid(row=0, column=2, sticky="e")
-        
-        # Results frame
+
+        self.batch_btn = CTk.CTkButton(
+            search_ctrl,
+            text="📋 Batch Import",
+            fg_color=COLOR_FRAME_BG,
+            hover_color="#333333",
+            text_color="white",
+            width=110,
+            height=40,
+            font=CTk.CTkFont(size=12, weight="bold"),
+            command=self.open_batch_import_modal
+        )
+        self.batch_btn.grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+        # 2. Audiophile Filters & Sorting Toolbar
+        toolbar = CTk.CTkFrame(self.search_view, fg_color="transparent")
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        toolbar.grid_columnconfigure(2, weight=1)
+
+        self.filter_quality_menu = CTk.CTkOptionMenu(
+            toolbar,
+            values=["All Qualities", "✨ Hi-Res (24-bit+)", "🏆 192kHz Master", "💿 CD Lossless (16-bit)"],
+            width=150,
+            height=28,
+            font=CTk.CTkFont(size=11),
+            fg_color=COLOR_FRAME_BG,
+            button_color=COLOR_FRAME_BG,
+            button_hover_color="#333333",
+            dropdown_fg_color=COLOR_FRAME_BG,
+            command=lambda v: self.apply_filter_and_sort()
+        )
+        self.filter_quality_menu.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self.sort_menu = CTk.CTkOptionMenu(
+            toolbar,
+            values=["Sort: Best Match", "Sort: Highest Quality", "Sort: Newest", "Sort: Title (A-Z)"],
+            width=150,
+            height=28,
+            font=CTk.CTkFont(size=11),
+            fg_color=COLOR_FRAME_BG,
+            button_color=COLOR_FRAME_BG,
+            button_hover_color="#333333",
+            dropdown_fg_color=COLOR_FRAME_BG,
+            command=lambda v: self.apply_filter_and_sort()
+        )
+        self.sort_menu.grid(row=0, column=1, sticky="w", padx=(0, 10))
+
+        self.results_stats_lbl = CTk.CTkLabel(
+            toolbar,
+            text="",
+            font=CTk.CTkFont(size=11),
+            text_color=COLOR_TEXT_MUTED,
+            anchor="e"
+        )
+        self.results_stats_lbl.grid(row=0, column=2, sticky="e")
+
+        # 3. Recent Searches Chips Frame
+        self.recent_frame = CTk.CTkFrame(self.search_view, fg_color="transparent")
+        self.recent_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        self.update_recent_searches_ui()
+
+        # 4. Results frame
         self.results_scroll = CTk.CTkScrollableFrame(self.search_view, fg_color=COLOR_FRAME_BG)
-        self.results_scroll.grid(row=1, column=0, sticky="nsew")
+        self.results_scroll.grid(row=3, column=0, sticky="nsew")
+
+    def update_recent_searches_ui(self):
+        if not hasattr(self, "recent_frame"):
+            return
+        for child in self.recent_frame.winfo_children():
+            child.destroy()
+        if not self.recent_searches:
+            self.recent_frame.grid_remove()
+            return
+        self.recent_frame.grid()
+        lbl = CTk.CTkLabel(self.recent_frame, text="Recent:", font=CTk.CTkFont(size=11), text_color=COLOR_TEXT_MUTED)
+        lbl.pack(side="left", padx=(0, 6))
+        for q in self.recent_searches[:5]:
+            btn = CTk.CTkButton(
+                self.recent_frame,
+                text=q if len(q) <= 22 else f"{q[:20]}...",
+                height=22,
+                font=CTk.CTkFont(size=10),
+                fg_color="#222222",
+                hover_color="#333333",
+                text_color="#c0d4e8",
+                corner_radius=11,
+                command=lambda term=q: self.quick_search(term)
+            )
+            btn.pack(side="left", padx=3)
+        clear_btn = CTk.CTkButton(
+            self.recent_frame,
+            text="✕ Clear",
+            height=22,
+            font=CTk.CTkFont(size=10),
+            fg_color="transparent",
+            hover_color="#2b2b2b",
+            text_color=COLOR_TEXT_MUTED,
+            command=self.clear_recent_searches
+        )
+        clear_btn.pack(side="left", padx=6)
+
+    def quick_search(self, term):
+        self.search_entry.delete(0, "end")
+        self.search_entry.insert(0, term)
+        self.trigger_search()
+
+    def clear_recent_searches(self):
+        self.recent_searches.clear()
+        if hasattr(self.config, "recent_searches"):
+            self.config.recent_searches = []
+            self.config.save()
+        self.update_recent_searches_ui()
 
     def clear_search_entry(self):
         """Clears the search input bar."""
+        self._render_batch_id = getattr(self, "_render_batch_id", 0) + 1
+        self.stop_preview_audio()
         self.search_entry.delete(0, "end")
         self.search_entry.focus_set()
 
     def show_search_status(self, text):
+        self._render_batch_id = getattr(self, "_render_batch_id", 0) + 1
+        self.stop_preview_audio()
         for child in self.results_scroll.winfo_children():
             child.destroy()
         lbl = CTk.CTkLabel(self.results_scroll, text=text, font=CTk.CTkFont(size=14, slant="italic"), justify="center")
@@ -1070,6 +1299,17 @@ class AppUI(CTk.CTk):
             messagebox.showwarning("Login Required", "You must be logged in to search Tidal catalog.")
             return
 
+        # Record in recent searches if not a direct URL
+        if not is_external_music_link(query) and not parse_tidal_url(query)[0]:
+            if query in self.recent_searches:
+                self.recent_searches.remove(query)
+            self.recent_searches.insert(0, query)
+            self.recent_searches = self.recent_searches[:10]
+            if hasattr(self.config, "recent_searches"):
+                self.config.recent_searches = self.recent_searches
+                self.config.save()
+            self.update_recent_searches_ui()
+
         self._search_gen = getattr(self, "_search_gen", 0) + 1
         my_gen = self._search_gen
 
@@ -1079,7 +1319,114 @@ class AppUI(CTk.CTk):
         self.show_search_status("Searching Tidal catalog...")
         
         search_type = self.search_type_menu.get().lower()
+        self._current_search_query = query
+        self._current_search_type = search_type
+        self._current_search_offset = 0
+        self._raw_search_items = []
+
         self.run_async(self.perform_search(query, search_type, gen=my_gen))
+
+    def stop_preview_audio(self):
+        """Immediately halts any running preview playback or ffmpeg transcoding thread."""
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+        if hasattr(self, "preview_proc") and self.preview_proc is not None:
+            try:
+                if self.preview_proc.poll() is None:
+                    self.preview_proc.terminate()
+                    self.preview_proc.wait(timeout=1)
+            except Exception:
+                pass
+            self.preview_proc = None
+        if hasattr(self, "active_pbtn") and self.active_pbtn:
+            try:
+                if self.active_pbtn.winfo_exists():
+                    self.active_pbtn.configure(text="▶ Preview")
+            except Exception:
+                pass
+            self.active_pbtn = None
+        self.preview_tid = None
+
+    def toggle_preview_ui(self, tid, pbtn):
+        """Streams a fast preview segment and plays it via Windows audio, with clean toggling."""
+        if getattr(self, "preview_tid", None) == tid:
+            self.stop_preview_audio()
+            return
+
+        self.stop_preview_audio()
+        if pbtn and pbtn.winfo_exists():
+            pbtn.configure(text="⏳")
+        self.preview_tid = tid
+        self.active_pbtn = pbtn
+        self._preview_gen = getattr(self, "_preview_gen", 0) + 1
+        my_gen = self._preview_gen
+
+        def play_stream():
+            try:
+                preview_dir = os.path.join(self.config.config_dir, "previews")
+                os.makedirs(preview_dir, exist_ok=True)
+                tmp_m4a = os.path.join(preview_dir, f"preview_{tid}.m4a")
+                tmp_wav = os.path.join(preview_dir, f"preview_{tid}.wav")
+
+                if not (os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000):
+                    async def fetch_audio():
+                        info = await self.api.get_stream_info(tid, "LOW")
+                        session = await self.api.get_session()
+                        with open(tmp_m4a, "wb") as f:
+                            if info.get("type") == "direct":
+                                async with session.get(info["url"]) as resp:
+                                    f.write(await resp.content.read(1024 * 500))
+                            else:
+                                async with session.get(info["init_url"]) as resp:
+                                    f.write(await resp.read())
+                                for seg in info.get("segment_urls", [])[:3]:
+                                    async with session.get(seg) as resp:
+                                        f.write(await resp.read())
+                        return tmp_m4a
+
+                    future = asyncio.run_coroutine_threadsafe(fetch_audio(), self.async_loop)
+                    future.result(timeout=30)
+
+                    if self._preview_gen != my_gen:
+                        return
+
+                    ff_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                    self.preview_proc = subprocess.Popen(
+                        [ff_exe, "-y", "-i", tmp_m4a, "-f", "wav", tmp_wav],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                    self.preview_proc.wait()
+
+                    try:
+                        if os.path.exists(tmp_m4a):
+                            os.remove(tmp_m4a)
+                    except Exception:
+                        pass
+
+                if self._preview_gen != my_gen:
+                    return
+
+                def safe_pbtn(txt):
+                    try:
+                        if pbtn and pbtn.winfo_exists():
+                            pbtn.configure(text=txt)
+                    except Exception:
+                        pass
+
+                if os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000:
+                    self.after(0, lambda: safe_pbtn("⏹ Stop"))
+                    import winsound
+                    winsound.PlaySound(tmp_wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                else:
+                    self.after(0, lambda: safe_pbtn("▶ Preview"))
+            except Exception as e:
+                print(f"Preview error: {e}")
+                self.after(0, lambda: safe_pbtn("▶ Preview"))
+
+        threading.Thread(target=play_stream, daemon=True).start()
 
     def finish_search(self, data, search_type, error_msg=None, gen=None):
         """Thread-safe UI callback for search completion with race-condition guard."""
@@ -1091,6 +1438,27 @@ class AppUI(CTk.CTk):
             messagebox.showerror("Search Error", error_msg)
         elif data is not None:
             self.populate_results(data, search_type)
+
+    def trigger_album_view(self, album_id, album_title=""):
+        """Jumps directly from a track to its parent album view."""
+        self.search_entry.delete(0, "end")
+        self.search_entry.insert(0, f"https://tidal.com/album/{album_id}")
+        self.search_type_menu.set("Albums")
+        self._search_gen = getattr(self, "_search_gen", 0) + 1
+        my_gen = self._search_gen
+        if hasattr(self, "search_btn") and self.search_btn.winfo_exists():
+            self.search_btn.configure(state="disabled", text="Searching...")
+        self.show_search_status(f"Loading album '{album_title}'..." if album_title else "Loading album...")
+
+        async def fetch():
+            try:
+                alb = await self.api.get_album(album_id)
+                res = {"albums": {"items": [alb], "totalNumberOfItems": 1}}
+                self.after(0, self.finish_search, res, "albums", None, my_gen)
+            except Exception as e:
+                self.after(0, self.finish_search, None, "albums", f"Failed to retrieve album: {e}", my_gen)
+
+        self.run_async(fetch())
 
     def trigger_artist_albums_search(self, artist_id, artist_name=""):
         """Directly retrieves and displays all catalog albums for an artist."""
@@ -1149,15 +1517,15 @@ class AppUI(CTk.CTk):
             try:
                 if url_type == "track":
                     track = await self.api.get_track(url_id)
-                    results = {"tracks": {"items": [track]}}
+                    results = {"tracks": {"items": [track], "totalNumberOfItems": 1}}
                     self.after(0, self.finish_search, results, "tracks", None, gen)
                 elif url_type == "album":
                     album = await self.api.get_album(url_id)
-                    results = {"albums": {"items": [album]}}
+                    results = {"albums": {"items": [album], "totalNumberOfItems": 1}}
                     self.after(0, self.finish_search, results, "albums", None, gen)
                 elif url_type == "playlist":
                     playlist = await self.api.get_playlist(url_id)
-                    results = {"playlists": {"items": [playlist]}}
+                    results = {"playlists": {"items": [playlist], "totalNumberOfItems": 1}}
                     self.after(0, self.finish_search, results, "playlists", None, gen)
                 elif url_type == "artist":
                     albums_resp = await self.api.get_artist_albums(url_id)
@@ -1176,236 +1544,483 @@ class AppUI(CTk.CTk):
             self.after(0, self.finish_search, None, search_type, f"Search request failed: {err_msg}", gen)
 
     def populate_results(self, data, search_type):
-        # Clear loading label
+        self.stop_preview_audio()
+        items = []
+        total = 0
+        if isinstance(data, dict):
+            if "items" in data and isinstance(data["items"], list):
+                items = data["items"]
+                total = data.get("totalNumberOfItems") or len(items)
+            elif search_type in data and isinstance(data[search_type], dict):
+                items = data[search_type].get("items", [])
+                total = data[search_type].get("totalNumberOfItems") or len(items)
+            else:
+                for cat in ["tracks", "albums", "playlists", "artists"]:
+                    if cat in data and isinstance(data[cat], dict) and len(data[cat].get("items", [])) > 0:
+                        items = data[cat].get("items", [])
+                        total = data[cat].get("totalNumberOfItems") or len(items)
+                        search_type = cat
+                        if hasattr(self, "search_type_menu") and self.search_type_menu.winfo_exists():
+                            self.search_type_menu.set(cat.capitalize())
+                        break
+
+        self._raw_search_items = [it for it in items if isinstance(it, dict) and ("id" in it or "uuid" in it)]
+        self._current_search_total = max(total, len(self._raw_search_items))
+        self._current_search_type = search_type
+        for it in self._raw_search_items:
+            if "_category" not in it:
+                it["_category"] = search_type
+        self.apply_filter_and_sort()
+
+    def apply_filter_and_sort(self):
+        self._render_batch_id = getattr(self, "_render_batch_id", 0) + 1
+        current_batch_id = self._render_batch_id
+        self.stop_preview_audio()
+
         for child in self.results_scroll.winfo_children():
             child.destroy()
-            
-        items = []
-        if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
-            items = data["items"]
-        elif search_type == "tracks" and "tracks" in data:
-            items = data["tracks"].get("items", [])
-        elif search_type == "albums" and "albums" in data:
-            items = data["albums"].get("items", [])
-        elif search_type == "playlists" and "playlists" in data:
-            items = data["playlists"].get("items", [])
-        elif search_type == "artists" and "artists" in data:
-            items = data["artists"].get("items", [])
-            
-        if not items:
-            lbl = CTk.CTkLabel(self.results_scroll, text="No results found.", font=CTk.CTkFont(size=14))
+
+        if not self._raw_search_items:
+            if hasattr(self, "results_stats_lbl") and self.results_stats_lbl.winfo_exists():
+                self.results_stats_lbl.configure(text="")
+            lbl = CTk.CTkLabel(self.results_scroll, text="No results found in Tidal catalog.", font=CTk.CTkFont(size=14))
             lbl.pack(pady=40)
             return
-            
-        for idx, item in enumerate(items):
-            row = CTk.CTkFrame(self.results_scroll, fg_color="transparent", height=90)
-            row.pack(fill="x", pady=5, padx=5)
-            row.pack_propagate(False)
-            
-            image_url = None
-            quality_badge_text = ""
-            quality_badge_color = "#333333"
 
-            btn_text = "Download"
-            if search_type == "tracks":
-                title = item.get("title", "Unknown Title")
-                artists = item.get("artists", [])
-                artist = artists[0]["name"] if artists else "Unknown Artist"
-                album_info = item.get("album", {})
-                album = album_info.get("title", "Unknown Album")
-                display_text = f"{title}\nBy {artist} — {album}"
-                item_id = item["id"]
-                action_func = lambda i=item_id, t=title: self.queue_track_download(i, t)
-                
-                cover_id = album_info.get("cover")
-                if cover_id:
-                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
-                
-                quality_badge_text, quality_badge_color = get_quality_badge(item)
-                    
-            elif search_type == "albums":
-                title = item.get("title", "Unknown Title")
-                artists = item.get("artists", [])
-                artist = artists[0]["name"] if artists else "Unknown Artist"
-                display_text = f"Album: {title}\nBy {artist}"
-                item_id = item["id"]
-                action_func = lambda i=item_id, t=title: self.queue_album_downloads(i, t)
-                
-                cover_id = item.get("cover")
-                if cover_id:
-                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
-                    
-                quality_badge_text, quality_badge_color = get_quality_badge(item)
-                    
-            elif search_type == "playlists":
-                title = item.get("title", "Unknown Title")
-                display_text = f"Playlist: {title}\nTracks: {item.get('numberOfTracks', 'Unknown')}"
-                item_id = item["uuid"]
-                action_func = lambda i=item_id, t=title: self.queue_playlist_downloads(i, t)
-                
-                cover_id = item.get("squareImage")
-                if cover_id:
-                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
-                    
-            elif search_type == "artists":
-                name = item.get("name", "Unknown Artist")
-                display_text = f"Artist: {name}"
-                item_id = item["id"]
-                action_func = lambda i=item_id, n=name: self.trigger_artist_albums_search(i, n)
-                btn_text = "View Albums"
-                
-                cover_id = item.get("picture")
-                if cover_id:
-                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
-                    
-            img_lbl = CTk.CTkLabel(row, text="Loading...", width=70, height=70, fg_color="#222222")
-            img_lbl.pack(side="left", padx=(0, 10))
-            
-            if image_url:
-                self.run_async(self.load_and_set_image(image_url, img_lbl))
-            else:
-                img_lbl.configure(text="No Image")
-                
-            if search_type == 'tracks':
-                def toggle_preview(tid=item_id, pbtn=None):
-                    # Stop current playback
-                    winsound.PlaySound(None, winsound.SND_PURGE)
-                    if self.preview_proc is not None:
-                        try:
-                            if self.preview_proc.poll() is None:
-                                self.preview_proc.terminate()
-                                self.preview_proc.wait(timeout=2)
-                        except Exception:
-                            pass
-                    
-                    # Reset previous button
-                    if self.active_pbtn and self.active_pbtn is not pbtn:
-                        try:
-                            self.active_pbtn.configure(text='▶')
-                        except Exception:
-                            pass
-                        
-                    # Toggle: if same track, stop
-                    if self.preview_tid == tid:
-                        self.preview_tid = None
-                        self.active_pbtn = None
-                        pbtn.configure(text='▶')
-                        # Increment generation to signal any running thread to abort
-                        self._preview_gen = getattr(self, '_preview_gen', 0) + 1
-                        return
-                        
-                    pbtn.configure(text='⏳')
-                    self.preview_tid = tid
-                    self.active_pbtn = pbtn
-                    # Increment generation so old threads know to abort
-                    self._preview_gen = getattr(self, '_preview_gen', 0) + 1
-                    my_gen = self._preview_gen
-                    
-                    def play_stream():
-                        try:
-                            # Use track-specific temp files in dedicated preview cache
-                            preview_dir = os.path.join(self.config.config_dir, "previews")
-                            os.makedirs(preview_dir, exist_ok=True)
-                            tmp_m4a = os.path.join(preview_dir, f"preview_{tid}.m4a")
-                            tmp_wav = os.path.join(preview_dir, f"preview_{tid}.wav")
-                            
-                            # Check if we already have cached WAV for this track
-                            if not (os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000):
-                                # Download audio segments
-                                async def fetch_audio():
-                                    info = await self.api.get_stream_info(tid, 'LOW')
-                                    session = await self.api.get_session()
-                                    with open(tmp_m4a, "wb") as f:
-                                        if info['type'] == 'direct':
-                                            async with session.get(info['url']) as resp:
-                                                f.write(await resp.content.read(1024 * 500))
-                                        else:
-                                            async with session.get(info['init_url']) as resp:
-                                                f.write(await resp.read())
-                                            for seg in info.get('segment_urls', [])[:3]:
-                                                async with session.get(seg) as resp:
-                                                    f.write(await resp.read())
-                                    return tmp_m4a
-                                    
-                                future = asyncio.run_coroutine_threadsafe(fetch_audio(), self.async_loop)
-                                future.result(timeout=30)
-                                
-                                # Abort if user switched to another track
-                                if self._preview_gen != my_gen:
-                                    return
-                                
-                                # Convert to WAV
-                                ff_exe = imageio_ffmpeg.get_ffmpeg_exe()
-                                self.preview_proc = subprocess.Popen(
-                                    [ff_exe, "-y", "-i", tmp_m4a, "-f", "wav", tmp_wav],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                                )
-                                self.preview_proc.wait()
-                                
-                                # Clean up m4a temp
-                                try:
-                                    os.remove(tmp_m4a)
-                                except Exception:
-                                    pass
-                            
-                            # Final abort check before playing
-                            if self._preview_gen != my_gen:
-                                return
-                            
-                            def safe_pbtn(txt):
-                                try:
-                                    if pbtn.winfo_exists():
-                                        pbtn.configure(text=txt)
-                                except Exception:
-                                    pass
+        quality_filter = self.quality_filter_menu.get() if hasattr(self, "quality_filter_menu") else "All"
+        sort_mode = self.sort_menu.get() if hasattr(self, "sort_menu") else "Best Match"
 
-                            if os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000:
-                                self.after(0, lambda: safe_pbtn('⏹'))
-                                winsound.PlaySound(tmp_wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                            else:
-                                self.after(0, lambda: safe_pbtn('▶'))
-                        except Exception as e:
-                            print('Preview error', e)
-                            self.after(0, lambda: safe_pbtn('▶'))
-                            
-                    threading.Thread(target=play_stream, daemon=True).start()
+        filtered = []
+        hires_count = 0
+        master_count = 0
 
-            # Pack action buttons to the right FIRST so they are anchored and never displaced
-            btn_box = CTk.CTkFrame(row, fg_color="transparent")
-            btn_box.pack(side="right", padx=(5, 10), pady=20)
+        for itm in self._raw_search_items:
+            if not isinstance(itm, dict):
+                continue
+            media_meta = itm.get("mediaMetadata", {})
+            tags = media_meta.get("tags", []) if isinstance(media_meta, dict) else []
+            audio_quality = itm.get("audioQuality", "")
+            audio_modes = itm.get("audioModes", [])
 
-            dl_btn = CTk.CTkButton(
-                btn_box, 
-                text=btn_text, 
-                fg_color=COLOR_ACCENT, 
-                hover_color=COLOR_ACCENT_HOVER, 
-                text_color="black",
-                width=100, 
-                font=CTk.CTkFont(size=11, weight="bold"),
-                command=action_func
+            is_hires = ("HIRES_LOSSLESS" in tags) or (audio_quality == "HI_RES_LOSSLESS") or ("MQA" in tags) or ("DOLBY_ATMOS" in audio_modes)
+            cached_specs = self._specs_cache.get(itm.get("id"))
+            if cached_specs:
+                spec_txt = cached_specs[0]
+                if "24-bit" in spec_txt:
+                    is_hires = True
+                if "192kHz" in spec_txt or "176.4kHz" in spec_txt:
+                    master_count += 1
+
+            is_master = is_hires and ("192" in str(tags) or "192" in str(audio_modes) or (cached_specs and "192kHz" in cached_specs[0]))
+            is_cd = ("LOSSLESS" in tags) or (audio_quality == "LOSSLESS") or (not is_hires)
+
+            if is_hires:
+                hires_count += 1
+            if is_master:
+                master_count += 1
+
+            if quality_filter == "Hi-Res 24-bit+":
+                if not is_hires:
+                    continue
+            elif quality_filter == "192kHz Master":
+                if not is_master and not is_hires:
+                    continue
+            elif quality_filter == "CD Lossless 16-bit":
+                if not is_cd and is_hires:
+                    continue
+            filtered.append(itm)
+
+        # 2. Sort
+        if sort_mode == "Highest Quality":
+            def quality_score(x):
+                mm = x.get("mediaMetadata", {})
+                tgs = mm.get("tags", []) if isinstance(mm, dict) else []
+                aq = x.get("audioQuality", "")
+                if "HIRES_LOSSLESS" in tgs or aq == "HI_RES_LOSSLESS":
+                    return 4
+                if "MQA" in tgs:
+                    return 3
+                if "LOSSLESS" in tgs or aq == "LOSSLESS":
+                    return 2
+                return 1
+            filtered.sort(key=quality_score, reverse=True)
+        elif sort_mode == "Newest":
+            def date_key(x):
+                return str(x.get("releaseDate") or x.get("streamStartDate") or x.get("year", ""))
+            filtered.sort(key=date_key, reverse=True)
+        elif sort_mode == "Title A-Z":
+            def title_key(x):
+                return str(x.get("title") or x.get("name") or "").lower()
+            filtered.sort(key=title_key)
+
+        # 3. Stats label update
+        total_raw = len(self._raw_search_items)
+        shown_count = len(filtered)
+        stats_txt = f"Showing {shown_count} of {total_raw} results • {hires_count} Hi-Res (24-bit+)"
+        if self._current_search_total > total_raw:
+            stats_txt = f"{stats_txt} (Catalog: {self._current_search_total}+)"
+        if hasattr(self, "results_stats_lbl") and self.results_stats_lbl.winfo_exists():
+            self.results_stats_lbl.configure(text=stats_txt)
+
+        if not filtered:
+            lbl = CTk.CTkLabel(self.results_scroll, text="No items match the selected quality filter.", font=CTk.CTkFont(size=14, slant="italic"))
+            lbl.pack(pady=40)
+            return
+
+        # 4. Progressive Chunked Rendering (Smooth 60 FPS UI)
+        initial_chunk = min(6, len(filtered))
+        for i in range(initial_chunk):
+            self._render_result_row(filtered[i], current_batch_id)
+
+        if initial_chunk < len(filtered):
+            def render_chunks(start_idx, b_id):
+                if b_id != getattr(self, "_render_batch_id", 0):
+                    return
+                end_idx = min(start_idx + 5, len(filtered))
+                for idx in range(start_idx, end_idx):
+                    self._render_result_row(filtered[idx], b_id)
+                if end_idx < len(filtered):
+                    self.after(22, lambda: render_chunks(end_idx, b_id))
+                else:
+                    self._append_load_more_btn_if_needed()
+
+            self.after(22, lambda: render_chunks(initial_chunk, current_batch_id))
+        else:
+            self._append_load_more_btn_if_needed()
+
+    def _append_load_more_btn_if_needed(self):
+        if self._current_search_total > len(self._raw_search_items) and self._current_search_type not in ("playlists", "artists"):
+            more_box = CTk.CTkFrame(self.results_scroll, fg_color="transparent")
+            more_box.pack(fill="x", pady=15)
+            more_btn = CTk.CTkButton(
+                more_box,
+                text=f"📥 Load More Results (Showing {len(self._raw_search_items)} of {self._current_search_total})",
+                fg_color=COLOR_FRAME_BG,
+                hover_color="#333333",
+                text_color="white",
+                border_color="#555555",
+                border_width=1,
+                height=36,
+                font=CTk.CTkFont(size=12, weight="bold"),
+                command=self.load_more_results
             )
-            dl_btn.pack(side="right", padx=(5, 0))
+            more_btn.pack(expand=True)
 
-            if search_type == 'tracks':
-                pbtn = CTk.CTkButton(btn_box, text='▶', width=30, fg_color='#444', hover_color='#666')
-                pbtn.configure(command=lambda p=pbtn, t=item_id: toggle_preview(tid=t, pbtn=p))
-                pbtn.pack(side="right", padx=(0, 5))
+    def load_more_results(self):
+        if getattr(self, "_is_loading_more", False):
+            return
+        self._is_loading_more = True
+        offset = len(self._raw_search_items)
+        q = self._current_search_query
+        st = self._current_search_type
 
-            # Pack text frame LAST with expand=True so it claims all remaining middle space
-            text_frame = CTk.CTkFrame(row, fg_color="transparent")
-            text_frame.pack(side="left", fill="both", expand=True)
+        async def fetch():
+            try:
+                res = await self.api.smart_search(q, search_type=st, limit=50, offset=offset)
+                new_items = []
+                if isinstance(res, dict):
+                    if st in res and isinstance(res[st], dict):
+                        new_items = res[st].get("items", [])
+                    elif "items" in res:
+                        new_items = res["items"]
+
+                def update_ui():
+                    self._is_loading_more = False
+                    if new_items:
+                        seen_ids = {it.get("id") or it.get("uuid") for it in self._raw_search_items if isinstance(it, dict)}
+                        for it in new_items:
+                            if isinstance(it, dict) and (it.get("id") or it.get("uuid")) not in seen_ids:
+                                seen_ids.add(it.get("id") or it.get("uuid"))
+                                it["_category"] = st
+                                self._raw_search_items.append(it)
+                        self.apply_filter_and_sort()
+                    else:
+                        self._current_search_total = len(self._raw_search_items)
+                        self.apply_filter_and_sort()
+
+                self.after(0, update_ui)
+            except Exception as e:
+                print(f"Load more error: {e}")
+                self._is_loading_more = False
+
+        self.run_async(fetch())
             
-            info_lbl = CTk.CTkLabel(text_frame, text=display_text, font=CTk.CTkFont(size=12), anchor="w", justify="left")
-            info_lbl.pack(anchor="w", pady=(5, 5))
-            
-            if quality_badge_text:
-                badge = CTk.CTkLabel(text_frame, text=quality_badge_text, font=CTk.CTkFont(size=10, weight="bold"), text_color="black", fg_color=quality_badge_color, corner_radius=4, padx=5, height=20)
-                badge.pack(anchor="w")
-                if search_type == 'tracks':
-                    self.run_async(self.load_and_set_specs(item_id, badge))
-            
-            divider = CTk.CTkFrame(self.results_scroll, fg_color="#333333", height=1)
-            divider.pack(fill="x", padx=5)
+    def _render_result_row(self, item, batch_id=None):
+        if batch_id is not None and batch_id != getattr(self, "_render_batch_id", 0):
+            return
+
+        item_cat = item.get("_category") or self._current_search_type
+        if item_cat in ("all", "everything") or not item_cat:
+            if "numberOfTracks" in item or "squareImage" in item or "uuid" in item:
+                item_cat = "playlists"
+            elif "tracks" in item or "numberOfVolumes" in item:
+                item_cat = "albums"
+            elif "picture" in item or ("name" in item and "title" not in item):
+                item_cat = "artists"
+            else:
+                item_cat = "tracks"
+
+        row = CTk.CTkFrame(self.results_scroll, fg_color="#181818", corner_radius=6, height=88)
+        row.pack(fill="x", pady=3, padx=5)
+        row.pack_propagate(False)
+
+        image_url = None
+        quality_badge_text, quality_badge_color = get_quality_badge(item)
+        btn_text = "Download"
+
+        album_info = item.get("album", {}) if isinstance(item.get("album"), dict) else {}
+        album_id_for_jump = None
+        album_title_for_jump = None
+
+        if item_cat == "tracks":
+            title = item.get("title", "Unknown Title")
+            artists = item.get("artists", [])
+            artist = artists[0]["name"] if artists else (item.get("artist") or {}).get("name", "Unknown Artist")
+            album_title = album_info.get("title", "Unknown Album")
+            album_id_for_jump = album_info.get("id")
+            album_title_for_jump = album_title
+
+            dur = item.get("duration", 0)
+            dur_str = f" • {dur // 60}:{dur % 60:02d}" if dur else ""
+            display_text = f"{title}\nBy {artist} — {album_title}{dur_str}"
+            item_id = item.get("id")
+            action_func = lambda i=item_id, t=title: self.queue_track_download(i, t)
+
+            cover_id = album_info.get("cover")
+            if cover_id:
+                image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
+
+        elif item_cat == "albums":
+            title = item.get("title", "Unknown Title")
+            artists = item.get("artists", [])
+            artist = artists[0]["name"] if artists else (item.get("artist") or {}).get("name", "Unknown Artist")
+            tracks_count = item.get("numberOfTracks", "?")
+            year_val = str(item.get("releaseDate") or "")[:4]
+            extra_year = f" • {year_val}" if year_val else ""
+            display_text = f"Album: {title}\nBy {artist} • {tracks_count} Tracks{extra_year}"
+            item_id = item.get("id")
+            action_func = lambda i=item_id, t=title: self.queue_album_downloads(i, t)
+
+            cover_id = item.get("cover")
+            if cover_id:
+                image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
+
+        elif item_cat == "playlists":
+            title = item.get("title", "Unknown Title")
+            display_text = f"Playlist: {title}\nTracks: {item.get('numberOfTracks', 'Unknown')}"
+            item_id = item.get("uuid") or item.get("id")
+            action_func = lambda i=item_id, t=title: self.queue_playlist_downloads(i, t)
+
+            cover_id = item.get("squareImage") or item.get("image")
+            if cover_id:
+                image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
+
+        elif item_cat == "artists":
+            name = item.get("name", "Unknown Artist")
+            display_text = f"Artist: {name}"
+            item_id = item.get("id")
+            action_func = lambda i=item_id, n=name: self.trigger_artist_albums_search(i, n)
+            btn_text = "View Albums"
+
+            cover_id = item.get("picture")
+            if cover_id:
+                image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
+
+        # Thumbnail
+        img_lbl = CTk.CTkLabel(row, text="⏳", width=70, height=70, corner_radius=4, fg_color="#222222")
+        img_lbl.pack(side="left", padx=(8, 10))
+
+        if image_url:
+            self.run_async(self.load_and_set_image(image_url, img_lbl))
+        else:
+            img_lbl.configure(text="No Image")
+                
+        # Action buttons on right
+        btn_box = CTk.CTkFrame(row, fg_color="transparent")
+        btn_box.pack(side="right", padx=(5, 10), pady=20)
+
+        dl_btn = CTk.CTkButton(
+            btn_box,
+            text=btn_text,
+            fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HOVER,
+            text_color="black",
+            width=95,
+            font=CTk.CTkFont(size=11, weight="bold"),
+            command=action_func
+        )
+        dl_btn.pack(side="right", padx=(5, 0))
+
+        if item_cat == "tracks":
+            pbtn = CTk.CTkButton(btn_box, text="▶ Preview", width=75, fg_color=COLOR_FRAME_BG, hover_color="#333333", border_color="#555555", border_width=1, font=CTk.CTkFont(size=11))
+            pbtn.configure(command=lambda p=pbtn, t=item_id: self.toggle_preview_ui(t, p))
+            pbtn.pack(side="right", padx=(4, 0))
+
+            if album_id_for_jump:
+                alb_jump_btn = CTk.CTkButton(
+                    btn_box,
+                    text="💽 Album",
+                    fg_color=COLOR_FRAME_BG,
+                    hover_color="#333333",
+                    text_color="#80d8ff",
+                    border_color="#555555",
+                    border_width=1,
+                    width=75,
+                    font=CTk.CTkFont(size=11),
+                    command=lambda aid=album_id_for_jump, atitle=album_title_for_jump: self.trigger_album_view(aid, atitle)
+                )
+                alb_jump_btn.pack(side="right", padx=(4, 0))
+
+        # Text and badges in middle
+        text_frame = CTk.CTkFrame(row, fg_color="transparent")
+        text_frame.pack(side="left", fill="both", expand=True)
+
+        info_lbl = CTk.CTkLabel(text_frame, text=display_text, font=CTk.CTkFont(size=12), anchor="w", justify="left")
+        info_lbl.pack(anchor="w", pady=(5, 5))
+
+        if quality_badge_text:
+            badge = CTk.CTkLabel(text_frame, text=quality_badge_text, font=CTk.CTkFont(size=10, weight="bold"), text_color="black", fg_color=quality_badge_color, corner_radius=4, padx=5, height=20)
+            badge.pack(anchor="w")
+            if item_cat == "tracks":
+                self.run_async(self.load_and_set_specs(item_id, badge))
+
+    def open_batch_import_modal(self):
+        BatchImportModal(self, on_process_batch=lambda lines: self.start_batch_import(lines))
+
+    def start_batch_import(self, urls):
+        """Processes a list of URLs or IDs and queues them for download."""
+        self.switch_view("queue")
+
+        async def worker():
+            total = len(urls)
+            queued_count = 0
+            for idx, raw_url in enumerate(urls):
+                url = raw_url.strip()
+                if not url:
+                    continue
+
+                try:
+                    # 1. External streaming links
+                    if is_external_music_link(url):
+                        resolved_q, res_type, _, _ = await resolve_external_link(url)
+                        if resolved_q:
+                            t_type = res_type or "tracks"
+                            res = await self.api.smart_search(resolved_q, search_type=t_type, limit=1)
+                            items = res.get(t_type, {}).get("items", []) if isinstance(res, dict) else []
+                            if items:
+                                itm = items[0]
+                                if t_type == "albums":
+                                    self.after(0, lambda i=itm["id"], t=itm.get("title", "Album"): self._queue_entire_album(i, t))
+                                else:
+                                    artists = itm.get("artists", [])
+                                    artist_name = artists[0]["name"] if artists else (itm.get("artist") or {}).get("name", "")
+                                    t_title = f"{itm.get('title')} - {artist_name}" if artist_name else itm.get("title", "Track")
+                                    self.after(0, lambda i=itm["id"], t=t_title: self.queue_track_download(i, t))
+                                queued_count += 1
+                        continue
+
+                    # 2. Tidal direct URL routing or ID
+                    u_type, u_id = parse_tidal_url(url)
+                    if u_type == "track":
+                        trk = await self.api.get_track(u_id)
+                        if trk and trk.get("id"):
+                            artists = trk.get("artists", [])
+                            artist_name = artists[0]["name"] if artists else (trk.get("artist") or {}).get("name", "")
+                            t_title = f"{trk.get('title')} - {artist_name}" if artist_name else trk.get("title", "Track")
+                            self.after(0, lambda i=trk["id"], t=t_title: self.queue_track_download(i, t))
+                            queued_count += 1
+                    elif u_type == "album":
+                        alb = await self.api.get_album(u_id)
+                        if alb and alb.get("id"):
+                            self.after(0, lambda i=alb["id"], t=alb.get("title", "Album"): self._queue_entire_album(i, t))
+                            queued_count += 1
+                    elif u_type == "playlist":
+                        pl = await self.api.get_playlist(u_id)
+                        if pl and pl.get("uuid"):
+                            self.after(0, lambda i=pl["uuid"], t=pl.get("title", "Playlist"): self._queue_entire_playlist(i, t))
+                            queued_count += 1
+                    elif url.isdigit():
+                        try:
+                            trk = await self.api.get_track(url)
+                            if trk and trk.get("id"):
+                                artists = trk.get("artists", [])
+                                artist_name = artists[0]["name"] if artists else ""
+                                t_title = f"{trk.get('title')} - {artist_name}" if artist_name else trk.get("title", "Track")
+                                self.after(0, lambda i=trk["id"], t=t_title: self.queue_track_download(i, t))
+                                queued_count += 1
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            alb = await self.api.get_album(url)
+                            if alb and alb.get("id"):
+                                self.after(0, lambda i=alb["id"], t=alb.get("title", "Album"): self._queue_entire_album(i, t))
+                                queued_count += 1
+                        except Exception:
+                            pass
+                    else:
+                        res = await self.api.smart_search(url, search_type="tracks", limit=1)
+                        trks = res.get("tracks", {}).get("items", []) if isinstance(res, dict) else []
+                        if trks:
+                            t = trks[0]
+                            artists = t.get("artists", [])
+                            artist_name = artists[0]["name"] if artists else ""
+                            t_title = f"{t.get('title')} - {artist_name}" if artist_name else t.get("title", "Track")
+                            self.after(0, lambda i=t["id"], tt=t_title: self.queue_track_download(i, tt))
+                            queued_count += 1
+                except Exception as e:
+                    print(f"[Batch Import] Error on '{url}': {e}")
+
+            def done():
+                messagebox.showinfo("Batch Import Complete", f"Successfully imported and queued {queued_count} of {total} items!")
+            self.after(0, done)
+
+        self.run_async(worker())
+
+    def _queue_entire_album(self, album_id, album_title):
+        async def f():
+            try:
+                alb = await self.api.get_album(album_id)
+                tracks_resp = await self.api.get_album_tracks(album_id)
+                tracks = tracks_resp.get("items", []) if isinstance(tracks_resp, dict) else []
+                art_obj = alb.get("artist") or (alb.get("artists", [{}])[0] if alb.get("artists") else {})
+                art_name = (art_obj.get("name") if isinstance(art_obj, dict) else None) or "Unknown Artist"
+                safe_artist = sanitize_filename(art_name)
+                safe_album = sanitize_filename(album_title)
+                folder_name = f"{safe_artist} - {safe_album}"
+                if len(folder_name) > 100:
+                    folder_name = folder_name[:100].rstrip(". ")
+                parent_dir = os.path.join(self.config.download_directory, folder_name)
+                # Thread-safe save album cover and metadata goodies
+                self.run_async(self.downloader.download_album_goodies(alb, parent_dir))
+                for t in tracks:
+                    if isinstance(t, dict) and t.get("id"):
+                        t_title = t.get("title", f"Track {t.get('id')}")
+                        t_artists = t.get("artists", [])
+                        t_artist_name = t_artists[0]["name"] if t_artists else art_name
+                        display_title = f"{t_title} - {t_artist_name}"
+                        self.after(0, lambda tid=t["id"], tt=display_title, pd=parent_dir: self.queue_track_download(tid, tt, parent_folder=pd))
+            except Exception as e:
+                print(f"Failed to queue entire album: {e}")
+        self.run_async(f())
+
+    def _queue_entire_playlist(self, playlist_id, playlist_title):
+        async def f():
+            try:
+                items = await self.api.get_playlist_tracks(playlist_id)
+                safe_pl = sanitize_filename(playlist_title)
+                parent_dir = os.path.join(self.config.download_directory, safe_pl)
+                for item in items:
+                    track_info = item.get("item") if "item" in item else item
+                    if track_info and "id" in track_info:
+                        tid = track_info["id"]
+                        t_artists = track_info.get("artists", [])
+                        t_artist = t_artists[0]["name"] if t_artists else "Unknown Artist"
+                        t_title = f"{track_info.get('title', 'Unknown Title')} - {t_artist}"
+                        self.after(0, lambda i=tid, tt=t_title, pd=parent_dir: self.queue_track_download(i, tt, parent_folder=pd))
+            except Exception as e:
+                print(f"Failed to queue entire playlist: {e}")
+        self.run_async(f())
 
     # --- Queue View ---
 
@@ -1435,6 +2050,9 @@ class AppUI(CTk.CTk):
 
         clear_btn = CTk.CTkButton(header, text="Clear Finished", width=100, fg_color=COLOR_FRAME_BG, hover_color="#333333", text_color="white", border_color=COLOR_ACCENT, border_width=1, command=self.clear_finished_downloads)
         clear_btn.pack(side="right", padx=5)
+
+        batch_q_btn = CTk.CTkButton(header, text="📋 Batch Import", width=110, fg_color=COLOR_FRAME_BG, hover_color="#333333", text_color="white", border_color="#555555", border_width=1, command=self.open_batch_import_modal)
+        batch_q_btn.pack(side="right", padx=5)
         
         # Scroll area
         self.queue_scroll = CTk.CTkScrollableFrame(self.queue_view, fg_color=COLOR_FRAME_BG)
@@ -1747,13 +2365,18 @@ class AppUI(CTk.CTk):
         self.switch_view("queue")
 
     async def download_worker(self):
-        max_c = getattr(self.config, 'concurrent_downloads', 3)
-        sem = asyncio.Semaphore(max_c)
         async def worker_task(tid):
-            async with sem:
-                if self.queue_items[tid]['status'] == 'cancelled' or self.queue_items[tid]['task_state']['is_cancelled']:
+            sem = getattr(self.downloader, "semaphore", None)
+            if sem:
+                async with sem:
+                    if self.queue_items.get(tid, {}).get("status") == "cancelled" or self.queue_items.get(tid, {}).get("task_state", {}).get("is_cancelled"):
+                        return
+                    await self.process_single_download(tid)
+            else:
+                if self.queue_items.get(tid, {}).get("status") == "cancelled" or self.queue_items.get(tid, {}).get("task_state", {}).get("is_cancelled"):
                     return
                 await self.process_single_download(tid)
+
         while not self.downloader.is_cancelled:
             if not self.pending_downloads:
                 await asyncio.sleep(0.5)
@@ -1794,6 +2417,29 @@ class AppUI(CTk.CTk):
             task_state = self.queue_items[tid].get("task_state")
             res = await self.downloader.download_track(tid, make_callback(tid), parent_folder, task_state)
             if tid in self.queue_items:
+                if isinstance(res, dict) and res.get("status") == "failed":
+                    self.queue_items[tid]["status"] = "failed"
+                    err_txt = res.get("error", "Download failed")
+                    is_delisted = "404" in err_txt or "delisted" in err_txt.lower()
+                    status_text = "Delisted / Unavailable (404)" if is_delisted else "Failed"
+                    def safe_failed(nid=tid, st=status_text, can_retry=not is_delisted):
+                        try:
+                            if nid in self.queue_items:
+                                pb = self.queue_items[nid].get("progress_bar")
+                                sl = self.queue_items[nid].get("status_lbl")
+                                rb = self.queue_items[nid].get("retry_btn")
+                                if pb and pb.winfo_exists():
+                                    pb.configure(progress_color="#f44336")
+                                if sl and sl.winfo_exists():
+                                    sl.configure(text=st, text_color="#f44336")
+                                if rb and rb.winfo_exists() and can_retry:
+                                    rb.pack(side="left", padx=2)
+                        except Exception:
+                            pass
+                    self.after(0, safe_failed)
+                    self.after(0, self.update_queue_summary)
+                    return
+
                 self.queue_items[tid]["status"] = "completed"
                 final_path = res.get("final_path") if isinstance(res, dict) else str(res)
                 self.queue_items[tid]["final_path"] = final_path
@@ -1835,7 +2481,10 @@ class AppUI(CTk.CTk):
             print(f"Download failed for track {tid}: {e}")
             if tid in self.queue_items:
                 self.queue_items[tid]["status"] = "failed"
-                def safe_failed(nid=tid):
+                err_str = str(e)
+                is_delisted = "404" in err_str or "delisted" in err_str.lower()
+                status_text = "Delisted / Unavailable (404)" if is_delisted else "Failed"
+                def safe_failed(nid=tid, st=status_text, can_retry=not is_delisted):
                     try:
                         if nid in self.queue_items:
                             pb = self.queue_items[nid].get("progress_bar")
@@ -1844,8 +2493,8 @@ class AppUI(CTk.CTk):
                             if pb and pb.winfo_exists():
                                 pb.configure(progress_color="#f44336")
                             if sl and sl.winfo_exists():
-                                sl.configure(text="Failed", text_color="#f44336")
-                            if rb and rb.winfo_exists():
+                                sl.configure(text=st, text_color="#f44336")
+                            if rb and rb.winfo_exists() and can_retry:
                                 rb.pack(side="left", padx=2)
                     except Exception:
                         pass
@@ -1931,15 +2580,20 @@ class AppUI(CTk.CTk):
         self.template_entry = CTk.CTkEntry(self.settings_view, width=300, height=35)
         self.template_entry.pack(anchor="w", pady=(0, 20))
         self.template_entry.insert(0, getattr(self.config, 'file_template', '{album}/{track_num} - {title}.{ext}'))
-        lbl_c = CTk.CTkLabel(self.settings_view, text='Concurrent Downloads (1-3)', font=CTk.CTkFont(size=13, weight='bold'))
+        lbl_c = CTk.CTkLabel(self.settings_view, text='Concurrent Downloads (1-5)', font=CTk.CTkFont(size=13, weight='bold'))
         lbl_c.pack(anchor="w", pady=(5, 5))
         slider_frame = CTk.CTkFrame(self.settings_view, fg_color="transparent")
         slider_frame.pack(anchor="w", pady=(0, 20))
-        self.concurrent_slider = CTk.CTkSlider(slider_frame, from_=1, to=3, number_of_steps=2, width=250)
+        self.concurrent_slider = CTk.CTkSlider(slider_frame, from_=1, to=5, number_of_steps=4, width=250)
         self.concurrent_slider.pack(side="left")
         self.concurrent_value_lbl = CTk.CTkLabel(slider_frame, text=str(int(getattr(self.config, 'concurrent_downloads', 3))), font=CTk.CTkFont(size=14, weight="bold"), text_color=COLOR_ACCENT, width=30)
         self.concurrent_value_lbl.pack(side="left", padx=10)
-        self.concurrent_slider.configure(command=lambda v: self.concurrent_value_lbl.configure(text=str(int(v))))
+        def on_concurrency_change(v):
+            val = int(v)
+            self.concurrent_value_lbl.configure(text=str(val))
+            if hasattr(self, "downloader") and hasattr(self.downloader, "update_concurrency"):
+                self.downloader.update_concurrency(val)
+        self.concurrent_slider.configure(command=on_concurrency_change)
         self.concurrent_slider.set(getattr(self.config, 'concurrent_downloads', 3))
         
         # Browser Selection
@@ -2012,6 +2666,8 @@ class AppUI(CTk.CTk):
         self.config.allow_dolby_atmos = new_atmos
         self.config.play_sound_on_complete = bool(self.sound_switch.get())
         self.config.concurrent_downloads = new_concurrent
+        if hasattr(self, "downloader") and hasattr(self.downloader, "update_concurrency"):
+            self.downloader.update_concurrency(new_concurrent)
         self.config.file_template = new_template
         
         # Check if keys changed

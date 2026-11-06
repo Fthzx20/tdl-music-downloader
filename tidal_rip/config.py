@@ -44,9 +44,9 @@ class Config:
         self.play_sound_on_complete = True
         self.concurrent_downloads = 3
         self.file_template = "{album}/{track_num} - {title}.{ext}"
+        self.recent_searches = []
         
         self.load()
-
 
     def load(self):
         """Loads config from file if it exists, otherwise creates defaults."""
@@ -81,8 +81,9 @@ class Config:
             self.login_browser = data.get("login_browser", "Default Browser")
             self.allow_dolby_atmos = data.get("allow_dolby_atmos", False)
             self.play_sound_on_complete = data.get("play_sound_on_complete", True)
-            self.concurrent_downloads = data.get("concurrent_downloads", 3)
+            self.concurrent_downloads = max(1, min(int(data.get("concurrent_downloads", 3)), 5))
             self.file_template = data.get("file_template", "{album}/{track_num} - {title}.{ext}")
+            self.recent_searches = data.get("recent_searches", [])
         except Exception as e:
             print(f"Error loading configuration: {e}")
 
@@ -103,7 +104,8 @@ class Config:
             "allow_dolby_atmos": self.allow_dolby_atmos,
             "play_sound_on_complete": self.play_sound_on_complete,
             "concurrent_downloads": self.concurrent_downloads,
-            "file_template": self.file_template
+            "file_template": self.file_template,
+            "recent_searches": self.recent_searches[:10]
         }
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
